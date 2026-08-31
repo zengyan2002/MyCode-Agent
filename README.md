@@ -14,6 +14,7 @@
 </p>
 
 <p align="center">
+  <a href="#界面展示">界面展示</a> ·
   <a href="#运行演示">运行演示</a> ·
   <a href="#核心能力">核心能力</a> ·
   <a href="#快速开始">快速开始</a> ·
@@ -35,6 +36,26 @@ MyCode 不是一次性生成代码的 Prompt 包装器。它让模型在同一�
 | **上下文生命周期** | 大工具结果落盘为 artifact，长对话结构化压缩，会话与长期记忆按项目保存并按需恢复 |
 | **五层安全机制** | Plan 只读约束、危险命令拦截、路径隔离、分层权限规则、运行模式与人工确认逐层生效 |
 | **多 Agent 双模式** | 委派式子 Agent 处理一次性独立任务；Agent Team 通过任务板、JSONL 邮箱和 Git Worktree 完成长流程协作 |
+
+## 界面展示
+
+### 权限确认
+
+工具执行触及受控资源时，终端会暂停当前调用并展示具体操作，用户可以选择拒绝、仅本次允许、本会话允许或永久允许。
+
+![MyCode 在读取项目文件前请求用户确认权限](assets/readme/permission-confirmation.png)
+
+### Plan 模式
+
+Plan 模式允许 Agent 读取项目并形成升级方案，同时拦截写操作和超出权限边界的命令；确认方案后可用 `/do` 切换回执行模式。
+
+![MyCode 在 Plan 模式中分析项目并拦截受限命令](assets/readme/plan-mode.png)
+
+### 多子 Agent 委派
+
+主 Agent 可以把不同维度的项目阅读任务委派给多个子 Agent，并在全部任务结束后汇总结果。
+
+![MyCode 委派三个子 Agent 并行阅读项目](assets/readme/subagent-delegation.png)
 
 ## 运行演示
 
