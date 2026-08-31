@@ -1,0 +1,121 @@
+active: claude-main
+
+providers:
+  - name: claude-main
+    protocol: anthropic
+    model: claude-model-id
+    base_url: https://api.anthropic.com/v1/messages
+    api_key: ${ANTHROPIC_API_KEY}
+    # 可选值：false、enabled、adaptive
+    thinking: adaptive
+    # 以下四项可省略，括号内是默认值。
+    context_window_tokens: 200000
+    compaction_output_tokens: 20000
+    tool_result_spill_chars: 50000
+    tool_batch_spill_chars: 200000
+
+  - name: openai-main
+    protocol: openai
+    model: openai-model-id
+    base_url: https://api.openai.com/v1/chat/completions
+    api_key: ${OPENAI_API_KEY}
+    thinking: false
+    context_window_tokens: 200000
+    compaction_output_tokens: 20000
+    tool_result_spill_chars: 50000
+    tool_batch_spill_chars: 200000
+
+# 可选：独立子 Agent 的前后台运行参数。
+agents:
+  # 定义式前台子 Agent 运行到该时间后移交后台；0 表示关闭自动移交。
+  auto_background_seconds: 120
+  # Agent 工具的外层最终上限。自动移交启用时必须严格大于上面的时间。
+  agent_tool_timeout_seconds: 135
+  # TaskManager 从 FIFO 队列同时启动的后台任务数量。
+  max_background_tasks: 4
+  # 是否把内置 Verification 角色加入可用目录。
+  enable_verification: false
+
+# 可选：子 Agent 独立 Worktree 的初始化和过期清理规则。
+worktrees:
+  # 临时 Worktree 最后使用超过 24 小时后，才进入清理候选。
+  stale_after_hours: 24
+  # 后台每 1800 秒检查一次；只删除能确认没有修改和新提交的临时目录。
+  cleanup_interval_seconds: 1800
+  # 从主仓库复制到新 Worktree 的本地配置。required 失败会终止创建。
+  copy_files:
+    - path: settings.local.json
+      required: false
+  # 链接到主仓库的大型依赖目录。Windows 创建链接可能需要相应权限。
+  symlink_directories:
+    - path: node_modules
+      required: false
+  # 只在 Git 已确认忽略的文件中匹配并复制运行文件。
+  copy_ignored:
+    - pattern: .env
+      required: false
+  # 只有显式配置时才为 Worktree 写 core.hooksPath；省略时不改 Git 配置。
+  hooks_path: .husky
+
+# 上述规则全部是显式配置。MyCode 不会默认复制 .env，也不会默认链接
+# .venv 或 node_modules；不同项目应按自己的依赖布局填写。
+
+# 可选：外部 MCP Server。每个 key 同时也是工具命名空间。
+mcp_servers:
+  local-files:
+    type: stdio
+    command: npx
+    args:
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - .
+    # 子进程先继承 MyCode 环境，再由这里的值覆盖。
+    env:
+      MCP_LOG_LEVEL: ${MCP_LOG_LEVEL}
+
+  team-tools:
+    type: streamable_http
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: Bearer ${MCP_ACCESS_TOKEN}
+      X-Workspace: project-${PROJECT_ID}
+
+# 可选：生命周期 Hook。用户级、项目级和本地规则会按顺序追加，不会互相覆盖。
+hooks:
+  # 新会话开始时，把项目说明放进下一次模型请求；不会写入对话历史。
+  - id: project-context
+    event: session_start
+    action:
+      type: prompt
+      message: "请先阅读 ARCHITECTURE.md，了解项目结构后再开始工作。"
+    once: true
+
+  # 工具真正执行前检查完整参数。命中后不执行工具，并把原因反馈给模型。
+  - id: protect-generated-files
+    event: pre_tool_use
+    if: 'tool == "write_file" && args.path ~= "vendor/**"'
+    action:
+      type: prompt
+      message: "vendor 目录由依赖管理工具维护，请不要手动修改。"
+    reject: true
+
+  # 写文件成功后运行格式化命令；失败只写 Hook 日志，不改判工具结果。
+  - id: format-python
+    event: post_tool_use
+    if: 'tool == "write_file" && args.path ~= "*.py"'
+    action:
+      type: command
+      command: "python -m black $FILE_PATH"
+      timeout: 10s
+
+  # 后台通知不会阻塞 Agent；pre_tool_use 不允许使用 async。
+  - id: notify-tool-finished
+    event: post_tool_use
+    action:
+      type: http
+      url: "https://hooks.example.com/mycode"
+      method: POST
+      headers:
+        Content-Type: application/json
+      body: '{"event":"$EVENT","tool":"$TOOL_NAME","file":"$FILE_PATH"}'
+    async: true

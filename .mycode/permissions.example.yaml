@@ -1,0 +1,12 @@
+# 复制为 .mycode/permissions.yaml 可作为项目共享权限配置。
+# 当前机器的永久授权写入 permissions.local.yaml，该文件不会提交。
+mode: default
+
+rules:
+  "Shell(git status)": allow
+  "Shell(git *)": allow
+  "Shell(git push --force *)": deny
+  "ReadFile(src/**)": allow
+  "WriteFile(src/**)": allow
+  "FindFiles(**/*.py)": allow
+  "SearchCode(src/**)": allow
