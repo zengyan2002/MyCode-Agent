@@ -8,8 +8,10 @@ import pytest
 
 from mycode.models.teams import BackendPreference, TeammateBackend
 from mycode.teams.backends.detection import BackendDetectionError, BackendDetector
-from mycode.teams.backends.base import TeammateLaunch
+from mycode.teams.backends.base import BackendHandle, TeammateLaunch
 from mycode.teams.backends.in_process import InProcessBackend
+from mycode.teams.backends.iterm2 import ITerm2Backend
+from mycode.teams.backends.tmux import TmuxBackend
 
 
 def test_auto_uses_in_process_when_no_pane_backend_exists(monkeypatch) -> None:
@@ -54,3 +56,20 @@ async def test_in_process_wake_is_consumed_once(tmp_path) -> None:
         assert not backend.wake_event(handle.reference).is_set()
     finally:
         await backend.stop(handle, force=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,method,expected", [
+    (TmuxBackend(), "_run_plain", ["tmux", "send-keys", "-t", "target", "", "Enter"]),
+    (ITerm2Backend(), "_run", ["it2", "send-text", "--session", "target", "\n"]),
+])
+async def test_terminal_wake_targets_recorded_handle(backend, method, expected, monkeypatch):
+    calls = []
+
+    async def run(args, *rest):
+        calls.append(args)
+        return 0, "", ""
+
+    monkeypatch.setattr(backend, method, run)
+    await backend.wake(BackendHandle(backend.backend, "target"))
+    assert calls == [expected]
