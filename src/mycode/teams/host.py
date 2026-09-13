@@ -17,6 +17,9 @@ from mycode.teams.runtime import TeamRuntimeLoader
 from mycode.teams.store import TeamStateStore
 
 
+_MAILBOX_POLL_SECONDS = 0.2
+
+
 class TeammateHost:
     """代表一个成员进程内持续存在、但只在收到事件时调用模型的循环。
 
@@ -57,7 +60,7 @@ class TeammateHost:
         Args:
             launch: Supervisor 生成的 team/member/generation、租约和工作区。
             wait_for_wake: 在成员空闲时等待一次唤醒的异步函数。
-                同进程后端传入 ``asyncio.Event.wait``，独立窗格
+                同进程后端传入消费并清除 Event 的函数，独立窗格
                 Host 传入等待标准输入的函数。
 
         Returns:
@@ -71,6 +74,7 @@ class TeammateHost:
             generation=launch.generation,
         )
         runtime = None
+        wake_task: asyncio.Task[None] | None = None
         try:
             # 在恢复对话前先验证租约，避免旧 Host 读取并继续写入新一代会话。
             self.store.update_member(
@@ -93,9 +97,35 @@ class TeammateHost:
             pending_prompt = launch.prompt.strip()
             first_prompt_pending = bool(pending_prompt)
             while True:
-                if not pending_prompt:
-                    await wait_for_wake()
                 messages = self.mailbox.read_unread(actor)
+                if not pending_prompt and not messages:
+                    self.store.update_member(
+                        actor,
+                        launch.agent_id,
+                        lambda member: replace(
+                            member, state=TeammateState.IDLE, updated_at=_now()
+                        ),
+                        lease_token=launch.lease_token,
+                    )
+                    if wake_task is None:
+                        wake_task = asyncio.create_task(wait_for_wake())
+                    while True:
+                        # 跨进程发送者可能没有后端回调；邮箱中的 wake 消息
+                        # 保留了通知。超时检查不取消已有的标准输入等待。
+                        done, _ = await asyncio.wait(
+                            (wake_task,), timeout=_MAILBOX_POLL_SECONDS
+                        )
+                        if done:
+                            completed_wait = wake_task
+                            wake_task = None
+                            completed_wait.result()
+                            messages = self.mailbox.read_unread(actor)
+                            break
+                        messages = self.mailbox.read_unread(actor)
+                        if any(message.wake for message in messages):
+                            break
+                    if not messages:
+                        continue
                 shutdown = any(
                     item.kind is TeamMessageKind.SHUTDOWN_REQUEST for item in messages
                 )
@@ -122,8 +152,7 @@ class TeammateHost:
                             launch.agent_id,
                         )
                         first_prompt_pending = False
-                    for message in messages:
-                        self.mailbox.acknowledge(actor, message)
+                    self.mailbox.acknowledge(actor, messages)
                 self.store.update_member(
                     actor,
                     launch.agent_id,
@@ -150,6 +179,9 @@ class TeammateHost:
                 pass
             raise
         finally:
+            if wake_task is not None:
+                wake_task.cancel()
+                await asyncio.gather(wake_task, return_exceptions=True)
             if runtime is not None:
                 runtime.close()
 
