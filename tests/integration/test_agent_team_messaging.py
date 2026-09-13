@@ -166,3 +166,20 @@ async def test_message_to_terminated_member_does_not_restart_it(tmp_path):
     assert not (await backend.probe(handle)).alive
     assert env.runtime.turns.empty()
     assert env.store.load_team(env.lead.team_id).members[0].state is TeammateState.TERMINATED
+
+
+@pytest.mark.asyncio
+async def test_initialized_idle_host_completes_supervisor_handshake(tmp_path, monkeypatch):
+    """恢复后没有初始提示的真实 Host 已经就绪，不应因空闲而握手超时。"""
+    monkeypatch.setattr("mycode.teams.supervisor._HOST_HANDSHAKE_TIMEOUT_SECONDS", 0.3)
+    env = make_host(tmp_path, prompt="")
+    backend, handle, supervisor, waiting, _ = await start_member(env, tmp_path)
+    try:
+        await asyncio.wait_for(waiting.get(), 3)
+        member = await supervisor._await_host_handshake(
+            env.lead.team_id, env.member.actor_id, backend, handle,
+        )
+        assert member.state is TeammateState.IDLE
+        assert env.runtime.turns.empty()
+    finally:
+        await backend.stop(handle, force=True)

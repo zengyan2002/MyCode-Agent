@@ -369,7 +369,7 @@ class TeammateSupervisor:
         adapter: TeammateBackendAdapter,
         handle: BackendHandle,
     ) -> TeammateRecord:
-        """等待 Host 自己完成会话恢复并写入 ``running`` 状态。
+        """等待 Host 完成会话恢复，进入执行或空闲等待状态。
 
         Args:
             team_id: 新成员所属团队 ID。
@@ -378,7 +378,7 @@ class TeammateSupervisor:
             handle: ``adapter.start`` 返回的真实后端句柄。
 
         Returns:
-            Host 已完成初始化并写为 ``running`` 的最新成员记录。
+            Host 已完成初始化并写为 ``running`` 或 ``idle`` 的最新成员记录。
 
         Raises:
             RuntimeError: Host 报告失败、提前退出，或十秒内没有完成握手。
@@ -392,7 +392,7 @@ class TeammateSupervisor:
                 for item in self.store.load_team(team_id).members
                 if item.agent_id == member_id
             )
-            if member.state is TeammateState.RUNNING:
+            if member.state in {TeammateState.RUNNING, TeammateState.IDLE}:
                 return member
             if member.state is TeammateState.FAILED:
                 raise RuntimeError("成员 Host 恢复会话时失败")
