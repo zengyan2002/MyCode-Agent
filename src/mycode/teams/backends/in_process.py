@@ -53,8 +53,14 @@ class InProcessBackend:
         reference = f"inproc-{secrets.token_hex(6)}"
         self._events[reference] = asyncio.Event()
         event = self._events[reference]
+
+        async def wait_for_wake() -> None:
+            """消费一次通知，之后的等待需要新的 Event.set。"""
+            await event.wait()
+            event.clear()
+
         task = asyncio.create_task(
-            self.host(launch, event.wait),
+            self.host(launch, wait_for_wake),
             name=f"team:{launch.agent_id}",
         )
         self._tasks[reference] = task

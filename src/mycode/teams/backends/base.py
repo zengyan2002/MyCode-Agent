@@ -114,5 +114,6 @@ class TeammateBackendAdapter(Protocol):
         """
 
 
+# 一次返回表示消费一次后端通知；没有新通知时，下一次调用应等待。
 WakeWaiter = Callable[[], Awaitable[None]]
 HostCoroutine = Callable[[TeammateLaunch, WakeWaiter], Awaitable[None]]
