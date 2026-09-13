@@ -144,7 +144,7 @@ class TeamMailbox:
         actor: TeamActorContext,
         messages: Sequence[MailboxMessage],
     ) -> MailboxCursor:
-        """在消息处理完成后把 cursor 推进到当前邮箱末尾。
+        """把 cursor 推进到本批已处理消息的末尾，保留后来到达的消息。
 
         Args:
             actor: 当前收件人身份。
@@ -161,16 +161,26 @@ class TeamMailbox:
         recipient = "lead" if actor.actor_kind == "lead" else actor.actor_id
         directory = self.store.team_dir(actor.team_id)
         path = directory / "mailboxes" / f"{recipient}.jsonl"
-        try:
-            offset = path.stat().st_size
-        except OSError as exc:
-            raise TeamMailboxError(f"无法读取邮箱大小：{exc}") from exc
-        cursor = MailboxCursor(offset, messages[-1].message_id)
-        _atomic_json(
-            directory / "cursors" / f"{recipient}.json",
-            {"byte_offset": cursor.byte_offset, "last_message_id": cursor.last_message_id},
-        )
-        return cursor
+        last_id = messages[-1].message_id
+        with ExclusiveFileLock(directory / "locks" / f"mailbox-{recipient}.lock", actor.actor_id):
+            current = self._read_cursor(directory, recipient)
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(current.byte_offset)
+                    for raw_line in handle:
+                        if not raw_line.endswith(b"\n"):
+                            break
+                        message = self._decode_message(raw_line.decode("utf-8"))
+                        if message.message_id == last_id:
+                            cursor = MailboxCursor(handle.tell(), last_id)
+                            _atomic_json(
+                                directory / "cursors" / f"{recipient}.json",
+                                {"byte_offset": cursor.byte_offset, "last_message_id": last_id},
+                            )
+                            return cursor
+            except (OSError, UnicodeError) as exc:
+                raise TeamMailboxError(f"无法确认收件箱消息：{exc}") from exc
+            raise TeamMailboxError(f"无法确认消息：未读邮箱中找不到 {last_id}")
 
     def drain_for_agent(
         self,
