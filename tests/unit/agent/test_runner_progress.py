@@ -191,3 +191,59 @@ async def test_normal_failed_results_are_observed(tmp_path, monkeypatch, code):
     agent = build_agent(tmp_path, provider, [tool])
     await collect(agent, "inspect")
     assert progress_messages(provider.requests[-1]) == [PROGRESS_REPLAN]
+
+
+@pytest.mark.asyncio
+async def test_main_turn_counter_is_not_inherited(tmp_path):
+    provider = FakeProvider([*(tool_response(i) for i in range(3)),
+        completed(ModelStopReason.END_TURN, TextBlock("one")),
+        tool_response(4), completed(ModelStopReason.END_TURN, TextBlock("two"))])
+    agent = build_agent(tmp_path, provider, [ScriptedTool("read", ToolAccess.READ)])
+    await collect(agent, "first")
+    await collect(agent, "second")
+    assert progress_messages(provider.requests[3]) == [PROGRESS_NOTICE]
+    assert all(not progress_messages(r) for r in provider.requests[4:])
+
+
+@pytest.mark.asyncio
+async def test_real_file_edit_then_read_does_not_warn(tmp_path):
+    from mycode.tools.builtin import create_builtin_registry
+
+    (tmp_path / "sample.txt").write_text("version 1", encoding="utf-8")
+    calls = [
+        ToolCall("read-1", "read_file", {"path": "sample.txt"}),
+        ToolCall("edit", "edit_file", {"path": "sample.txt", "old_text": "version 1", "new_text": "version 2"}),
+        ToolCall("read-2", "read_file", {"path": "sample.txt"}),
+    ]
+    provider = FakeProvider([*(completed(ModelStopReason.TOOL_USE, call) for call in calls),
+                             completed(ModelStopReason.END_TURN, TextBlock("done"))])
+    agent = build_agent(tmp_path, provider, registry=create_builtin_registry())
+    events = await collect(agent, "update file")
+    outputs = [json.loads(m.content) for m in history(agent) if isinstance(m, ToolResultMessage)]
+    assert all(output["success"] for output in outputs)
+    assert "version 1" in outputs[0]["content"] and "version 2" in outputs[2]["content"]
+    assert (tmp_path / "sample.txt").read_text(encoding="utf-8") == "version 2"
+    assert not any(progress_messages(r) for r in provider.requests)
+    assert not any(isinstance(e, AgentWarningEvent) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_improving_test_results_do_not_warn(tmp_path, monkeypatch):
+    test_tool = ScriptedTool("pytest", ToolAccess.READ)
+    edit = ScriptedTool("edit", ToolAccess.WRITE)
+    outputs = [ToolOutput.fail(ToolErrorCode.COMMAND_FAILED, "8 failed"),
+               ToolOutput.fail(ToolErrorCode.COMMAND_FAILED, "3 failed"),
+               ToolOutput.ok("all passed")]
+
+    async def execute(arguments, context):
+        return outputs.pop(0)
+
+    monkeypatch.setattr(test_tool, "execute", execute)
+    provider = FakeProvider([*(tool_response(i, name) for i, name in
+                              enumerate(["pytest", "edit", "pytest", "edit", "pytest"])),
+                             completed(ModelStopReason.END_TURN, TextBlock("done"))])
+    agent = build_agent(tmp_path, provider, [test_tool, edit])
+    events = await collect(agent, "fix tests")
+    assert not outputs
+    assert not any(progress_messages(r) for r in provider.requests)
+    assert not any(isinstance(e, AgentWarningEvent) for e in events)
