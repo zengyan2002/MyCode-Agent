@@ -11,6 +11,12 @@ from mycode.agent.cancellation import (
     CancellationReason,
     CancellationToken,
 )
+from mycode.agent.progress import ProgressMonitor, PROGRESS_NOTICE, PROGRESS_REPLAN
+from mycode.constants import (
+    PROGRESS_TRACE_MAX_STEPS,
+    PROGRESS_WARN_AFTER_ROUNDS,
+    PROGRESS_REPLAN_AFTER_ROUNDS,
+)
 from mycode.agent.instructions import (
     RuntimeInstructionManager,
     deferred_tools_instruction,
@@ -63,7 +69,7 @@ from mycode.models.messages import (
 )
 from mycode.models.model_calls import ModelCallBudget, ModelCallPurpose
 from mycode.models.hooks import HookContext, HookEvent
-from mycode.models.prompts import PromptContext, RuntimeInstruction
+from mycode.models.prompts import PromptContext, RuntimeInstruction, RuntimeInstructionKind
 from mycode.models.provider import (
     ModelStopReason,
     ProviderCompleted,
@@ -140,7 +146,7 @@ class AgentTurnRequest:
     resolve_tool_view: Callable[[ToolView], ToolView] = lambda view: view
     # 主会话记录实际 Provider 前缀时使用；独立子 Agent 传 None，不能继续 Fork。
     parent_recorder: ParentRunRecorder | None = None
-    # Fork 首次及后续请求原样复用父 PromptContext.runtime；None 才动态收集环境。
+    # Fork 复用父 runtime，但排除父 Turn 的进度提醒；None 才动态收集环境。
     fixed_runtime: tuple[RuntimeInstruction, ...] | None = None
     # Fork 的 initial_messages 已包含最后一条任务 UserMessage；True 时不重复追加。
     user_already_in_history: bool = False
@@ -228,12 +234,18 @@ class AgentTurnRunner:
                 表示正式发送并消费通知。
 
         Returns:
-            Fork 指定 ``fixed_runtime`` 时原样返回父请求指令；其他运行从
+            Fork 指定 ``fixed_runtime`` 时返回排除父进度提醒的指令；其他运行从
             RuntimeInstructionManager 预览或正式取得当前指令。
         """
 
         if run.fixed_runtime is not None:
-            return run.fixed_runtime
+            return tuple(
+                instruction for instruction in run.fixed_runtime
+                if not (
+                    instruction.kind is RuntimeInstructionKind.RUNTIME_NOTICE
+                    and instruction.content in (PROGRESS_NOTICE, PROGRESS_REPLAN)
+                )
+            )
         if preview:
             return run.instruction_manager.preview(
                 plan_only=run.options.plan_only
@@ -534,6 +546,12 @@ class AgentTurnRunner:
         user_message = UserMessage(run.user_text)
         turn_messages: list[ChatMessage] = [user_message]
         budget = ModelCallBudget(run.options.max_model_calls)
+        progress_monitor = ProgressMonitor(
+            max_steps=PROGRESS_TRACE_MAX_STEPS,
+            warn_after_rounds=PROGRESS_WARN_AFTER_ROUNDS,
+            replan_after_rounds=PROGRESS_REPLAN_AFTER_ROUNDS,
+        )
+        pending_progress_instruction: RuntimeInstruction | None = None
         current_session: ToolScheduleSession | None = None
         current_assistant: AssistantMessage | None = None
         current_result_indexes: set[int] = set()
@@ -648,6 +666,9 @@ class AgentTurnRunner:
                             run.hook_scope,
                         )
                         runtime = self._runtime_for(run, preview=False)
+                        # 此提示属于即将取得的模型响应；紧急压缩重试仍需保留。
+                        request_progress_instruction = pending_progress_instruction
+                        pending_progress_instruction = None
                         if deferred is not None:
                             runtime = (*runtime, deferred)
                         finalizing = budget.finalization_required
@@ -659,6 +680,8 @@ class AgentTurnRunner:
                                 ),
                             )
                         else:
+                            if request_progress_instruction is not None:
+                                runtime = (*runtime, request_progress_instruction)
                             reminder = budget_instruction(
                                 budget.remaining_model_calls
                             )
@@ -794,6 +817,8 @@ class AgentTurnRunner:
                                         ),
                                     )
                                 else:
+                                    if request_progress_instruction is not None:
+                                        runtime = (*runtime, request_progress_instruction)
                                     reminder = budget_instruction(
                                         budget.remaining_model_calls
                                     )
@@ -960,7 +985,9 @@ class AgentTurnRunner:
                             )
                             return
 
+                        invocations = current_session.invocations
                         results = await current_session.finalize()
+                        decision = progress_monitor.observe_round(invocations, results)
                         current_session = None
                         current_assistant = None
                         failures, committed = self._commit_tool_round(
@@ -969,6 +996,12 @@ class AgentTurnRunner:
                             results,
                         )
                         turn_messages.extend(committed)
+                        if decision.message is not None:
+                            pending_progress_instruction = RuntimeInstruction(
+                                RuntimeInstructionKind.RUNTIME_NOTICE, decision.message,
+                            )
+                            if decision.emit_warning:
+                                yield AgentWarningEvent(decision.message)
                         if failures:
                             yield self._tool_result_warning(failures)
                         current_result_indexes.clear()
