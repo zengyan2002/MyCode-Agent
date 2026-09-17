@@ -11,9 +11,9 @@ from mycode.models.messages import TextBlock, ToolCall, ToolResultMessage
 from mycode.models.permissions import PermissionMode
 from mycode.models.prompts import RuntimeInstruction, RuntimeInstructionKind
 from mycode.models.provider import ModelStopReason
-from mycode.models.tools import ToolAccess, ToolView
-from tests.unit.agent.test_loop import FakeProvider, ScriptedTool, completed
-from tests.unit.agent.test_runner_progress import tool_response, progress_messages
+from mycode.models.tools import ToolView
+from tests.unit.agent.test_loop import FakeProvider, completed
+from tests.unit.agent.test_runner_progress import progress_messages
 from tests.unit.agents.test_runtime import _builder, _spec
 from mycode.tools.builtin.files import ReadFileTool
 

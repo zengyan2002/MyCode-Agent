@@ -1,6 +1,5 @@
 """通过真实 AgentLoop/Runner 验证进度提醒与工具轮次提交。"""
 
-import asyncio
 import json
 from dataclasses import replace
 
