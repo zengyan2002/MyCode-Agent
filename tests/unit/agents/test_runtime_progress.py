@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -42,7 +43,7 @@ async def test_independent_entry_progress_and_next_turn_isolation(tmp_path, orig
     try:
         first_runner = builder.build(spec)
         first = await first_runner.start().wait()
-        second_runner = builder.build(replace(spec, run_id="progress-two"))
+        second_runner = builder.build(replace(spec, run_id="progress-two", execution_id=uuid4().hex))
         second = await second_runner.start().wait()
     finally:
         await hooks.close()

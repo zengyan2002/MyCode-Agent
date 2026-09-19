@@ -62,6 +62,7 @@ class AgentRunOptions:
 
 # 对外错误码把不同内部异常归一化，UI 无需依赖具体异常类型。
 class AgentErrorCode(str, Enum):
+    OPERATION_UNRESOLVED = "operation_unresolved"
     PROVIDER_ERROR = "provider_error"
     PROTOCOL_ERROR = "protocol_error"
     CANCELLED = "cancelled"

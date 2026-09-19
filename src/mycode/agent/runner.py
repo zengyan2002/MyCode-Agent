@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from mycode.agent.cancellation import (
     CancellationController,
@@ -91,6 +91,10 @@ from mycode.providers.runner import (
 from mycode.skills.runtime import SkillRuntime
 from mycode.tools.registry import ToolRegistry
 from mycode.tools.scheduler import ToolScheduleSession, ToolScheduler
+from mycode.models.operations import OperationScope, ToolBatchRecord
+from mycode.persistence.operations import operation_io
+from mycode.persistence.sessions import SessionManager
+from mycode.tools.recovery import OperationRecovery
 
 
 class _CancellationObserved(Exception):
@@ -108,6 +112,7 @@ class AgentTurnRequest:
 
     # 用户本轮输入；主会话是原始文本，fork 是触发 Skill 的任务说明。
     user_text: str
+    operation_scope: OperationScope
     # 读取当前对话历史。压缩后再次调用会拿到更新后的消息。
     history: Callable[[], tuple[ChatMessage, ...]]
     # 把已确认发生的用户、助手和工具结果写入当前主会话或临时会话。
@@ -154,6 +159,8 @@ class AgentTurnRequest:
     drain_external_messages: Callable[[], tuple[ChatMessage, ...]] = lambda: ()
     # False 用于后台通知唤醒回合：消息仍写入历史，但 UI 不显示成用户手输。
     emit_user_event: bool = True
+    # 主会话和长期团队成员逐批落盘；一次性子 Agent 只写自己的内存历史。
+    session_manager: SessionManager | None = None
 
     def __post_init__(self) -> None:
         """检查运行所需的文本字段不是空白。
@@ -427,11 +434,12 @@ class AgentTurnRunner:
             redact_secrets("\n".join(lines), self._secrets)
         )
 
-    def _commit_tool_round(
+    async def _commit_tool_round(
         self,
         run: AgentTurnRequest,
         assistant: AssistantMessage,
         results: tuple[ToolExecutionResult, ...],
+        batch: ToolBatchRecord,
     ) -> tuple[
         tuple[ToolResultSaveFailure, ...],
         tuple[ChatMessage, ...],
@@ -455,11 +463,24 @@ class AgentTurnRunner:
                 assistant,
                 *self._tool_messages(original_results),
             )
-            run.append_messages(messages)
+            await self._append_tool_batch(run, batch, messages)
             raise
         messages = (assistant, *self._tool_messages(outcome.results))
-        run.append_messages(messages)
+        await self._append_tool_batch(run, batch, messages)
         return outcome.failures, messages
+
+    async def _append_tool_batch(self, run: AgentTurnRequest, batch: ToolBatchRecord,
+                           messages: tuple[ChatMessage, ...]) -> None:
+        """保存完整批次及身份，成功后才标记已经写入会话。"""
+        if run.session_manager is not None:
+            await operation_io(run.session_manager.reconcile_tool_batch, batch, messages)
+            await operation_io(self._scheduler.store.mark_history_committed, batch.batch_id)
+        else:
+            run.append_messages(messages)
+
+    def operation_scope(self, session_id: str, runtime_id: str, execution_id: str) -> OperationScope:
+        """让独立运行也使用执行器的真实目录和团队身份登记工具。"""
+        return self._scheduler.operation_scope(session_id, runtime_id, execution_id)
 
     @staticmethod
     def _request_message(
@@ -554,10 +575,18 @@ class AgentTurnRunner:
         pending_progress_instruction: RuntimeInstruction | None = None
         current_session: ToolScheduleSession | None = None
         current_assistant: AssistantMessage | None = None
+        current_batch: ToolBatchRecord | None = None
+        batch_number = 0
         current_result_indexes: set[int] = set()
         active_model_call_number: int | None = None
 
         try:
+            await operation_io(self._scheduler.store.begin_execution, run.operation_scope)
+            blocked = await OperationRecovery(self._scheduler.store).unresolved(run.operation_scope.runtime_id)
+            if blocked:
+                run = replace(run, options=replace(run.options, plan_only=True))
+                yield AgentWarningEvent("原工具结果未确认，当前仅允许只读核查：" +
+                                        ", ".join(record.operation_id for record in blocked))
             if run.emit_user_event:
                 yield UserMessageEvent(run.user_text)
             if not run.user_already_in_history:
@@ -938,8 +967,11 @@ class AgentTurnRunner:
                             )
 
                         current_assistant = assistant
+                        batch_number += 1
+                        current_batch = await self._scheduler.prepare_batch(run.operation_scope, batch_number, assistant)
                         current_session = self._scheduler.schedule(
                             calls,
+                            batch=current_batch,
                             model_call_number=model_call_number,
                             options=run.options,
                             cancellation=controller.token,
@@ -970,10 +1002,11 @@ class AgentTurnRunner:
                                     yield ToolResultEvent(invocation, result)
                             current_session = None
                             current_assistant = None
-                            failures, committed = self._commit_tool_round(
+                            failures, committed = await self._commit_tool_round(
                                 run,
                                 assistant,
                                 results,
+                                current_batch,
                             )
                             turn_messages.extend(committed)
                             if failures:
@@ -990,12 +1023,21 @@ class AgentTurnRunner:
                         decision = progress_monitor.observe_round(invocations, results)
                         current_session = None
                         current_assistant = None
-                        failures, committed = self._commit_tool_round(
+                        failures, committed = await self._commit_tool_round(
                             run,
                             assistant,
                             results,
+                            current_batch,
                         )
                         turn_messages.extend(committed)
+                        if any(result.error_code in {
+                            ToolErrorCode.OPERATION_UNKNOWN, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                            ToolErrorCode.OPERATION_IN_PROGRESS, ToolErrorCode.OPERATION_CONFLICT,
+                        } for result in results):
+                            yield self._safe_error(AgentErrorCode.OPERATION_UNRESOLVED,
+                                "工具效果或执行记录无法确认，已停止当前任务。使用 /operations list 查看。",
+                                budget.used_model_calls)
+                            return
                         if decision.message is not None:
                             pending_progress_instruction = RuntimeInstruction(
                                 RuntimeInstructionKind.RUNTIME_NOTICE, decision.message,
@@ -1087,10 +1129,11 @@ class AgentTurnRunner:
                         ):
                             if invocation.call_index not in current_result_indexes:
                                 yield ToolResultEvent(invocation, result)
-                        failures, committed = self._commit_tool_round(
+                        failures, committed = await self._commit_tool_round(
                             run,
                             current_assistant,
                             results,
+                            current_batch,
                         )
                         turn_messages.extend(committed)
                         if failures:
@@ -1104,9 +1147,17 @@ class AgentTurnRunner:
                         budget.used_model_calls,
                     )
                     return
+        except asyncio.CancelledError:
+            yield self._safe_error(AgentErrorCode.CANCELLED, "Agent 请求已取消", budget.used_model_calls)
+        except MyCodeError as exc:
+            yield self._safe_error(AgentErrorCode.INTERNAL_ERROR, str(exc), budget.used_model_calls)
         finally:
             if current_session is not None and current_assistant is not None:
                 results = await current_session.finalize(
                     ToolErrorCode.CANCELLED
                 )
-                self._commit_tool_round(run, current_assistant, results)
+                await self._commit_tool_round(run, current_assistant, results, current_batch)
+            try:
+                await operation_io(self._scheduler.store.finish_execution, run.operation_scope.execution_id)
+            except MyCodeError:
+                pass  # 保留未决记录；此前的存储错误仍向用户报告，不能覆盖原错误。

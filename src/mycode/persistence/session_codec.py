@@ -40,6 +40,9 @@ class SessionRecord:
 
     timestamp: datetime
     message: ChatMessage
+    execution_id: str | None = None
+    batch_id: str | None = None
+    batch_position: int | None = None
 
 
 def _string(value: Any, field: str) -> str:
@@ -173,6 +176,9 @@ class SessionCodec:
                     "is_error": message.is_error,
                 }
             )
+        if record.batch_id is not None:
+            payload.update(execution_id=record.execution_id, batch_id=record.batch_id,
+                           batch_position=record.batch_position)
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     def decode(self, line: str) -> SessionRecord:
@@ -218,7 +224,8 @@ class SessionCodec:
             )
         else:
             raise SessionDecodeError(f"未知消息类型：{kind}")
-        return SessionRecord(timestamp, message)
+        return SessionRecord(timestamp, message, payload.get("execution_id"),
+                             payload.get("batch_id"), payload.get("batch_position"))
 
 
 class SessionRuntimeMetadataCodec:

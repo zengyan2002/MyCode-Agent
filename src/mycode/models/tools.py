@@ -30,6 +30,10 @@ class ToolSource(str, Enum):
 
 
 class ToolErrorCode(str, Enum):
+    OPERATION_IN_PROGRESS = "operation_in_progress"
+    OPERATION_UNKNOWN = "operation_unknown"
+    OPERATION_CONFLICT = "operation_conflict"
+    OPERATION_STORAGE_ERROR = "operation_storage_error"
     INVALID_ARGUMENTS = "invalid_arguments"
     UNKNOWN_TOOL = "unknown_tool"
     PATH_OUTSIDE_WORKSPACE = "path_outside_workspace"
@@ -179,6 +183,8 @@ class ToolInvocation:
     model_call_number: int
     # 在本次模型响应中的零基索引，用于并发完成后恢复原顺序。
     call_index: int
+    # 真正调度工具时必须有值；UI 展示和单独权限检查可以尚未登记操作。
+    operation_id: str = ""
 
     def __post_init__(self) -> None:
         if (

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+import os
+from dataclasses import replace
+from uuid import uuid4
 from collections.abc import AsyncIterator, Sequence
 
 from mycode.agent.cancellation import CancellationToken
@@ -13,7 +16,9 @@ from mycode.models.events import (
     ToolResultEvent,
     ToolStartedEvent,
 )
-from mycode.models.messages import ToolCall
+from mycode.models.messages import AssistantMessage, ToolCall
+from mycode.models.operations import ClaimKind, OperationScope, OperationState, ToolBatchRecord
+from mycode.persistence.operations import OperationError, operation_io
 from mycode.models.tools import (
     ToolActivationState,
     ToolAccess,
@@ -47,6 +52,27 @@ class ToolScheduler:
         self._observers = tuple(observers)
 
     @property
+    def store(self):
+        """返回当前项目的持久化工具记录。"""
+        return self._executor.store
+
+    def operation_scope(self, session_id: str, runtime_id: str, execution_id: str) -> OperationScope:
+        """从真实工作目录和团队身份构造调用归属，不接受模型提供身份。"""
+        actor = self._executor.context.team_actor
+        actor_key = None if actor is None else f"{actor.team_id}:{actor.actor_kind}:{actor.actor_id}:{actor.generation}"
+        return OperationScope(session_id, execution_id, runtime_id,
+                              self._executor.context.workspace_root, actor_key)
+
+    async def prepare_batch(self, scope: OperationScope, number: int,
+                            assistant: AssistantMessage) -> ToolBatchRecord:
+        """执行前保存整条助手消息与每个工具的可信读写类别。"""
+        scope = self.operation_scope(scope.session_id, scope.runtime_id, scope.execution_id)
+        accesses = tuple(self._registry.get(call.name).definition.access
+                         if self._registry.get(call.name) is not None else ToolAccess.WRITE
+                         for call in assistant.tool_calls)
+        return await operation_io(self.store.prepare_batch, scope, number, assistant, accesses)
+
+    @property
     def tool_activation(self) -> ToolActivationState:
         """返回工具执行上下文中当前 Agent 独享的 MCP 激活状态。
 
@@ -62,6 +88,7 @@ class ToolScheduler:
         self,
         calls: tuple[ToolCall, ...],
         *,
+        batch: ToolBatchRecord,
         model_call_number: int,
         options: AgentRunOptions,
         cancellation: CancellationToken,
@@ -88,6 +115,8 @@ class ToolScheduler:
 
         if not calls:
             raise ValueError("工具调度至少需要一个调用")
+        if calls != batch.assistant.tool_calls:
+            raise OperationError("调度调用与已保存批次不一致")
         # 未知工具按写类处理：即使后续执行器会返回“未知工具”，也不能让
         # 未声明分类的调用绕过写屏障或仅规划模式拦截。
         invocation_list: list[ToolInvocation] = []
@@ -105,6 +134,7 @@ class ToolScheduler:
                     access=access,
                     model_call_number=model_call_number,
                     call_index=index,
+                    operation_id=batch.operation_ids[index],
                 )
             )
         invocations = tuple(invocation_list)
@@ -118,6 +148,7 @@ class ToolScheduler:
             cancellation,
             hook_scope,
             visible_tool_names,
+            batch.scope,
         )
 
 #负责执行模型本轮返回的一批工具调用，并管理执行顺序、并发、取消和结果收尾。
@@ -139,6 +170,7 @@ class ToolScheduleSession:
         cancellation: CancellationToken,
         hook_scope: HookRunScope,
         visible_tool_names: frozenset[str] | None,
+        scope: OperationScope,
     ) -> None:
         self._invocations = invocations
         self._executor = executor
@@ -147,6 +179,8 @@ class ToolScheduleSession:
         self._options = options
         self._cancellation = cancellation
         self._hook_scope = hook_scope
+        self._scope = scope
+        self._halted = False
         # None 保留旧调用行为；集合表示必须严格限制在本轮模型可见名字中。
         self._visible_tool_names = visible_tool_names
         # 并发读工具按完成顺序产生事件，但结果以原始 call_index 为键保存；
@@ -210,29 +244,48 @@ class ToolScheduleSession:
             options=self._options,
             hook_scope=self._hook_scope,
         )
+        token = uuid4().hex
+        entered_executor = False
         try:
+            claim = await operation_io(self._executor.store.claim, invocation.operation_id,
+                                       invocation.call, self._scope, os.getpid(), token)
+            if claim.kind is ClaimKind.REPLAY:
+                assert claim.record.result is not None
+                return replace(claim.record.result, tool_call_id=invocation.call.id)
+            if claim.kind is not ClaimKind.EXECUTE:
+                code = {ClaimKind.IN_PROGRESS: ToolErrorCode.OPERATION_IN_PROGRESS,
+                        ClaimKind.UNKNOWN: ToolErrorCode.OPERATION_UNKNOWN,
+                        ClaimKind.CONFLICT: ToolErrorCode.OPERATION_CONFLICT}[claim.kind]
+                return self._failure(invocation, code,
+                    f"操作未重新执行：{claim.kind.value}。操作：{invocation.operation_id}", started)
             if (
                 self._visible_tool_names is not None
                 and invocation.call.name not in self._visible_tool_names
             ):
-                return self._failure(
+                result = self._failure(
                     invocation,
                     ToolErrorCode.BLOCKED,
                     "该工具不在当前 Skill 允许的工具范围内",
                     started,
                 )
+                await operation_io(self._executor.store.complete, invocation.operation_id, token, result, started=False)
+                return result
             for interceptor in self._interceptors:
                 decision = await interceptor.before_tool(context)
                 if not decision.allowed:
                     assert decision.error_code is not None
                     assert decision.message is not None
-                    return self._failure(
+                    result = self._failure(
                         invocation,
                         decision.error_code,
                         decision.message,
                         started,
                     )
-            result = await self._executor.execute(invocation.call)
+                    await operation_io(self._executor.store.complete, invocation.operation_id, token, result, started=False)
+                    return result
+            entered_executor = True
+            result = await self._executor.execute(invocation.call, operation_id=invocation.operation_id,
+                                                  scope=self._scope, owner_token=token)
             # observer 只观察真正经过 Executor 的调用；被 Plan 模式拦截的
             # 调用没有执行事实，不应被审计为“已执行”。
             await notify_observers(
@@ -242,16 +295,35 @@ class ToolScheduleSession:
             )
             return result
         except asyncio.CancelledError:
+            record = await operation_io(self._executor.store.get, invocation.operation_id)
+            if record.state is OperationState.RUNNING and record.owner_token == token:
+                result = self._failure(invocation, ToolErrorCode.CANCELLED, "工具调用已取消", started)
+                if entered_executor:
+                    await operation_io(self._executor.store.mark_unknown, invocation.operation_id, token,
+                                       "工具调用中断，效果无法确认", result)
+                else:
+                    await operation_io(self._executor.store.complete, invocation.operation_id, token, result, started=False)
             raise
+        except OperationError as exc:
+            return self._failure(invocation, ToolErrorCode.OPERATION_STORAGE_ERROR, str(exc), started)
         except Exception:
             # 调度扩展点的未知异常不能击穿 Agent。固定错误文本避免把工具
             # 参数、路径或环境细节意外回灌给模型。
-            return self._failure(
+            result = self._failure(
                 invocation,
                 ToolErrorCode.INTERNAL_ERROR,
                 "工具因内部调度错误而未能执行",
                 started,
             )
+            record = await operation_io(self._executor.store.get, invocation.operation_id)
+            if record.state is OperationState.RUNNING and record.owner_token == token:
+                if entered_executor:
+                    await operation_io(self._executor.store.mark_unknown, invocation.operation_id, token,
+                                       "调用未取得可确认结果", result)
+                    return self._failure(invocation, ToolErrorCode.OPERATION_UNKNOWN,
+                                         f"工具效果无法确认。操作：{invocation.operation_id}", started)
+                await operation_io(self._executor.store.complete, invocation.operation_id, token, result, started=False)
+            return result
 
     def _failure(
         self,
@@ -321,6 +393,10 @@ class ToolScheduleSession:
             #删除键为 task 的记录；如果字典里找不到这个任务，就返回 None，不要抛出 KeyError。
             self._active.pop(task, None)
             self._results[invocation.call_index] = result
+            self._halted = result.error_code in {
+                ToolErrorCode.OPERATION_UNKNOWN, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                ToolErrorCode.OPERATION_IN_PROGRESS, ToolErrorCode.OPERATION_CONFLICT,
+            }
             yield ToolResultEvent(invocation, result)
         finally:
             #清理等待用户取消指令的等待器
@@ -346,12 +422,13 @@ class ToolScheduleSession:
         cancel_waiter = asyncio.create_task(self._cancellation.wait())
         try:
             #只要还有待启动或正在运行的工具，并且任务没有被取消，就继续循环。
-            while (queued or self._active) and not self._cancellation.is_cancelled:
+            while (queued or self._active) and not self._cancellation.is_cancelled and not self._halted:
                 #在并发上限允许的情况下，尽可能多地启动读取工具。
                 while (
                     queued
                     and len(self._active) < self._options.max_read_concurrency
                     and not self._cancellation.is_cancelled
+                    and not self._halted
                 ):
                     #取出待完成工具队列中的第一个工具
                     invocation = queued.pop(0)
@@ -403,6 +480,10 @@ class ToolScheduleSession:
                 invocation = self._active.pop(task)
                 result = await task
                 self._results[invocation.call_index] = result
+                self._halted = result.error_code in {
+                    ToolErrorCode.OPERATION_UNKNOWN, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                    ToolErrorCode.OPERATION_IN_PROGRESS, ToolErrorCode.OPERATION_CONFLICT,
+                }
                 yield ToolResultEvent(invocation, result)
         finally:
             cancel_waiter.cancel()
@@ -437,7 +518,7 @@ class ToolScheduleSession:
         self._stream_started = True
         try:
             for group in self._groups():
-                if self._cancellation.is_cancelled:
+                if self._cancellation.is_cancelled or self._halted:
                     break
                 #当前组的第一个为只读工具，则该组都是只读
                 if group[0].access is ToolAccess.READ:
@@ -467,6 +548,8 @@ class ToolScheduleSession:
         #防止重复收尾
         if self._finalized is not None:
             return self._finalized
+        if self._halted and reason is None:
+            reason = ToolErrorCode.OPERATION_UNKNOWN
 
         #reason为None就代表调用方声称这是正常结束
         #正常结束得满足所有事件流都结束以及所有调用都有结果
@@ -493,11 +576,23 @@ class ToolScheduleSession:
         if reason is not None:
             for invocation in self._invocations:
                 if invocation.call_index not in self._results:
-                    self._results[invocation.call_index] = self._failure(
+                    result = self._failure(
                         invocation,
                         reason,
                         "工具调用在完成前被取消",
                     )
+                    try:
+                        await operation_io(self._executor.store.finish_unstarted, invocation.operation_id, result)
+                        record = await operation_io(self._executor.store.get, invocation.operation_id)
+                        if record.state is OperationState.COMPLETED and record.result is not None:
+                            result = record.result
+                        elif record.state in (OperationState.UNKNOWN, OperationState.RUNNING):
+                            result = self._failure(invocation, ToolErrorCode.OPERATION_UNKNOWN,
+                                                   f"工具效果无法确认。操作：{invocation.operation_id}")
+                    except OperationError:
+                        result = self._failure(invocation, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                                               f"无法保存取消记录。操作：{invocation.operation_id}")
+                    self._results[invocation.call_index] = result
 
         # 无论并发完成顺序如何，最终结果都严格按原始 call_index 排列，
         # 以满足 Provider 对 tool_calls/tool_results 配对顺序的要求。

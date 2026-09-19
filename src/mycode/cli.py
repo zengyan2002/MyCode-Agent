@@ -1,6 +1,7 @@
 """控制台入口及运行依赖组装。"""
 
 from __future__ import annotations
+from mycode.persistence.operations import OperationStore
 
 import argparse
 import asyncio
@@ -440,6 +441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     executor = ToolExecutor(
         registry,
         tool_context,
+        store=OperationStore(workspace_root),
         timeout_seconds=TOOL_TIMEOUT_SECONDS,
     )
 

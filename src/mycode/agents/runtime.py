@@ -19,6 +19,8 @@ from mycode.hooks.adapters import PostToolHookObserver, PreToolHookInterceptor
 from mycode.hooks.engine import HookEngine
 from mycode.hooks.runtime import HookRunScope
 from mycode.errors import MyCodeError
+from mycode.persistence.operations import OperationStore
+from mycode.persistence.sessions import SessionManager
 from mycode.models.agents import (
     AgentRunResult,
     AgentUsage,
@@ -310,6 +312,7 @@ class IndependentAgentRunner:
         permission_approver: AgentPermissionApprover,
         skill_approver: _AgentSkillApprover,
         workspace_service: AgentWorkspaceService,
+        sessions: SessionManager | None = None,
     ) -> None:
         """保存 Builder 为本次运行创建的全部独立对象。
 
@@ -343,6 +346,7 @@ class IndependentAgentRunner:
         self._permission_approver = permission_approver
         self._skill_approver = skill_approver
         self._workspace_service = workspace_service
+        self._sessions = sessions
 
     @property
     def history(self):
@@ -410,11 +414,16 @@ class IndependentAgentRunner:
         status = BackgroundTaskStatus.FAILED
         try:
             await self._workspace_service.mark_running(self._spec)
-            self._conversation.extend(self._spec.initial_messages)
+            if self._sessions is None:
+                self._conversation.extend(self._spec.initial_messages)
             request = AgentTurnRequest(
                 user_text=self._spec.task_prompt,
+                operation_scope=self._turn_runner.operation_scope(self._spec.session_id,
+                    (f"team:{self._spec.team_actor.team_id}:{self._spec.team_actor.actor_id}:{self._spec.session_id}"
+                     if self._spec.team_actor is not None else self._spec.run_id), self._spec.execution_id),
+                session_manager=self._sessions,
                 history=lambda: self._conversation.history,
-                append_messages=self._conversation.extend,
+                append_messages=(self._sessions.append if self._sessions is not None else self._conversation.extend),
                 context_manager=self._context_manager,
                 instruction_manager=self._instruction_manager,
                 stable_prompt=self._spec.prompt.stable,
@@ -596,7 +605,7 @@ class IndependentAgentRuntimeBuilder:
         self._user_memory_root = user_memory_root
         self._secrets = tuple(secrets)
 
-    def build(self, spec: IndependentAgentSpec) -> IndependentAgentRunner:
+    def build(self, spec: IndependentAgentSpec, *, sessions: SessionManager | None = None) -> IndependentAgentRunner:
         """为一份冻结 spec 创建完整且互不共享的运行对象。
 
         Args:
@@ -609,7 +618,7 @@ class IndependentAgentRuntimeBuilder:
 
         if spec.workspace is None:
             raise ValueError("独立 Agent 必须先准备工作区再装配 Runner")
-        conversation = Conversation()
+        conversation = sessions.conversation if sessions is not None else Conversation()
         workspace_binding = (
             WorkspaceBinding.fixed(spec.workspace)
             if spec.workspace is not None
@@ -684,7 +693,7 @@ class IndependentAgentRuntimeBuilder:
         )
         pre_hooks = PreToolHookInterceptor(self._hook_engine)
         post_hooks = PostToolHookObserver(self._hook_engine)
-        executor = ToolExecutor(self._registry, tool_context)
+        executor = ToolExecutor(self._registry, tool_context, store=OperationStore(self._workspace_root))
         scheduler = ToolScheduler(
             self._registry,
             executor,
@@ -721,6 +730,7 @@ class IndependentAgentRuntimeBuilder:
             permission_approver,
             skill_approver,
             self._workspace_service,
+            sessions,
         )
 
     async def abandon(

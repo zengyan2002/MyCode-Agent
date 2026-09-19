@@ -6,7 +6,9 @@ import asyncio
 import time
 
 from mycode.models.messages import ToolCall
-from mycode.models.tools import ToolErrorCode, ToolExecutionResult
+from mycode.models.operations import OperationScope, OperationState, operation_failure
+from mycode.models.tools import ToolAccess, ToolErrorCode, ToolExecutionResult
+from mycode.persistence.operations import OperationError, OperationStore, operation_io
 from mycode.tools.base import ToolContext, ToolFailure, ToolOutput
 from mycode.tools.registry import ToolRegistry
 
@@ -20,6 +22,7 @@ class ToolExecutor:
         registry: ToolRegistry,
         context: ToolContext,
         *,
+        store: OperationStore,
         timeout_seconds: float = 30.0,
     ) -> None:
         """创建执行器并保存注册表、工具上下文和默认超时。
@@ -37,6 +40,7 @@ class ToolExecutor:
             raise ValueError("工具超时时间必须为正数")
         self._registry = registry
         self._context = context
+        self.store = store
         self._timeout_seconds = timeout_seconds
 
     @property
@@ -50,7 +54,8 @@ class ToolExecutor:
 
         return self._context
 
-    async def execute(self, call: ToolCall) -> ToolExecutionResult:
+    async def execute(self, call: ToolCall, *, operation_id: str,
+                      scope: OperationScope, owner_token: str) -> ToolExecutionResult:
         """执行一次模型工具调用。
 
         Args:
@@ -63,9 +68,14 @@ class ToolExecutor:
         # 计时覆盖查找、参数校验和实际执行，使 UI 看到的是本次调用从进入
         # 执行边界到形成结果的总耗时，而不只是工具函数内部耗时。
         started = time.monotonic()
+        record = await operation_io(self.store.get, operation_id)
+        if (record.state is not OperationState.RUNNING or record.owner_token != owner_token
+                or record.scope != scope or record.call != call
+                or self._context.workspace_root != scope.workspace_root):
+            raise OperationError("工具执行身份、目录或领取记录不匹配")
         tool = self._registry.get(call.name)
         if tool is None:
-            return self._result(
+            result = self._result(
                 call,
                 ToolOutput.fail(
                     ToolErrorCode.UNKNOWN_TOOL,
@@ -73,6 +83,8 @@ class ToolExecutor:
                 ),
                 started,
             )
+            await operation_io(self.store.complete, operation_id, owner_token, result, started=False)
+            return result
 
         validation_error = self._registry.validate_arguments(
             call.name,
@@ -81,7 +93,7 @@ class ToolExecutor:
         if validation_error is not None:
             # Schema 失败必须在调用 tool.execute 前返回，保证无效模型参数
             # 绝不会到达文件系统或 Shell 副作用代码。
-            return self._result(
+            result = self._result(
                 call,
                 ToolOutput.fail(
                     ToolErrorCode.INVALID_ARGUMENTS,
@@ -89,6 +101,8 @@ class ToolExecutor:
                 ),
                 started,
             )
+            await operation_io(self.store.complete, operation_id, owner_token, result, started=False)
+            return result
 
         policy = self._registry.execution_policy(call.name)
         timeout_seconds = (
@@ -96,6 +110,7 @@ class ToolExecutor:
             if policy is not None and policy.timeout_seconds is not None
             else self._timeout_seconds
         )
+        cancelled = False
         try:
             # asyncio.timeout 会先向工具协程注入 CancelledError，使命令工具
             # 有机会终止进程树，再由下面的分支转换成普通超时结果。
@@ -111,7 +126,8 @@ class ToolExecutor:
             # 文件不存在；其他异常必须走下面的固定脱敏消息。
             output = ToolOutput.fail(exc.code, str(exc))
         except asyncio.CancelledError:
-            raise
+            cancelled = True
+            output = ToolOutput.fail(ToolErrorCode.CANCELLED, "工具执行期间收到取消，效果可能已经发生")
         except Exception:
             # 内部异常可能包含路径、环境变量或依赖库细节，因此模型可见的
             # 消息刻意保持笼统，避免泄露运行环境信息。
@@ -119,7 +135,34 @@ class ToolExecutor:
                 ToolErrorCode.INTERNAL_ERROR,
                 "工具因未预期的内部错误而失败",
             )
-        return self._result(call, output, started)
+        result = self._result(call, output, started)
+        uncertain = record.access is ToolAccess.WRITE and output.error_code in {
+            ToolErrorCode.TIMEOUT, ToolErrorCode.CANCELLED, ToolErrorCode.IO_ERROR,
+            ToolErrorCode.REMOTE_ERROR, ToolErrorCode.INTERNAL_ERROR,
+        }
+        try:
+            if uncertain:
+                await operation_io(self.store.mark_unknown, operation_id, owner_token,
+                                   result.error_message or "工具效果无法确认", result)
+                return operation_failure(call, ToolErrorCode.OPERATION_UNKNOWN,
+                    f"工具可能已经生效，结果无法确认。操作：{operation_id}。{result.error_message}")
+            await operation_io(self.store.complete, operation_id, owner_token, result, started=True)
+        except (OperationError, asyncio.CancelledError):
+            # 本体已结束，提交线程可能已经成功；先查记录，不能覆盖已提交结果。
+            try:
+                saved = await operation_io(self.store.get, operation_id)
+                if saved.state is OperationState.COMPLETED:
+                    return saved.result
+                if saved.state is OperationState.RUNNING:
+                    await operation_io(self.store.mark_unknown, operation_id, owner_token,
+                                       "工具已返回，但结果未能保存", result)
+            except OperationError:
+                pass  # 保留 RUNNING，后续不能重新领取。
+            return operation_failure(call, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                                     f"工具结果未能确认保存，已停止执行。操作：{operation_id}")
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     def _result(
         self,

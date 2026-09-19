@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import uuid4
+from mycode.tools.recovery import OperationRecovery
+from mycode.persistence.operations import OperationError, operation_io
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -32,12 +35,14 @@ from mycode.models.config import SecretValue
 from mycode.models.hooks import HookContext, HookEvent
 from mycode.models.events import (
     AgentEvent,
+    AgentWarningEvent,
     AgentFinalizationProfile,
     AgentRunOptions,
     CompactionStatusEvent,
     CompactionStatusKind,
 )
-from mycode.models.messages import ChatMessage
+from mycode.models.messages import ChatMessage, UserMessage
+from mycode.models.operations import ResolutionVerdict
 from mycode.models.provider import ProviderRequest, ToolChoice
 from mycode.models.prompts import PromptContext, RuntimeInstruction
 from mycode.models.tools import (
@@ -150,6 +155,7 @@ class AgentLoop:
         self._session_manager = session_manager
         self._registry = registry
         self._scheduler = scheduler
+        self._operation_recovery = OperationRecovery(scheduler.store)
         # 规则定义由应用共用；该 scope 只保存当前主会话自己的运行状态。
         self._hook_engine = hook_engine
         if not stable_prompt.strip():
@@ -269,6 +275,7 @@ class AgentLoop:
         self._running = True
         try:
             # 通过会话id取出要恢复的旧会话信息
+            await self._operation_recovery.reconcile(f"main:{session_id}", self._session_manager)
             candidate = self._session_manager.read_candidate(session_id)
             workspace_assignment: WorkspaceAssignment | None = None
             workspace_stable = self._stable_prompt
@@ -577,6 +584,54 @@ class AgentLoop:
             ),
         )
 
+    async def list_operations(self, *, all_sessions: bool = False):
+        """列出当前会话及子运行的执行记录，或当前项目的全部记录。"""
+        return await operation_io(self._scheduler.store.list_operations,
+            session_id=None if all_sessions else self._session_manager.current_id)
+
+    async def inspect_operation(self, operation_id: str):
+        """读取本项目操作及用户核查记录，不访问其他项目数据库。"""
+        record = await operation_io(self._scheduler.store.recover_orphan, operation_id)
+        notes = await operation_io(self._scheduler.store.resolutions, operation_id)
+        return record, notes
+
+    async def resolve_operation(self, operation_id: str, verdict: ResolutionVerdict, note: str):
+        """保存用户对未知工具效果的实际核查，不执行工具。"""
+        if self._running:
+            raise ConcurrentTurnError("当前请求仍在运行，不能修改执行判断")
+        record = await operation_io(self._scheduler.store.resolve, operation_id, verdict, note)
+        self._session_manager.append((UserMessage(
+            f"[用户核查工具操作 {operation_id}] {verdict.value}：{note}"),))
+        return record
+
+    async def retry_operation(self, operation_id: str, cancellation: CancellationToken, *, plan_only: bool = False):
+        """在当前主会话的真实权限下执行原步骤；不能代执行子 Agent 操作。"""
+        if self._running:
+            raise ConcurrentTurnError("当前请求仍在运行，不能重试工具")
+        self._running = True
+        try:
+            record = await operation_io(self._scheduler.store.get, operation_id)
+            scope = self._scheduler.operation_scope(self._session_manager.current_id,
+                f"main:{self._session_manager.current_id}", record.scope.execution_id)
+            view = self._team_tool_view_resolver(ToolView(active_mcp_names=frozenset(self._tool_activation.active_mcp_names)))
+            if self._skill_runtime is not None:
+                from dataclasses import replace
+                allowed = self._skill_runtime.merged_allowlist()
+                if allowed is not None and view.business_allowlist is not None:
+                    allowed = allowed & view.business_allowlist
+                elif allowed is None:
+                    allowed = view.business_allowlist
+                view = replace(view, active_skill_names=self._skill_runtime.active_names, business_allowlist=allowed)
+            _, resolved = self._registry.definitions_for(view)
+            result = await self._operation_recovery.retry(operation_id, scope=scope, scheduler=self._scheduler,
+                options=AgentRunOptions(plan_only=plan_only), cancellation=cancellation,
+                hook_scope=self._hook_scope, visible_tool_names=resolved.visible_tool_names)
+            self._session_manager.append((UserMessage(
+                f"[用户重试工具操作 {operation_id}] {result.to_model_json()}"),))
+            return result
+        finally:
+            self._running = False
+
     def estimate_input_tokens(self, *, plan_only: bool) -> int:
         """估算当前会话下一次普通 Agent 请求的输入 Token 数量。
 
@@ -685,6 +740,7 @@ class AgentLoop:
             raise ConcurrentTurnError("同一会话已有请求正在运行")
         run_options = options or AgentRunOptions()
         external = cancellation or CancellationToken()
+        runtime_id = f"main:{self._session_manager.current_id}"
 
         def completed_turn(messages: tuple[ChatMessage, ...]) -> None:
             """把主会话已经落盘的完整回合交给记忆后台。
@@ -703,6 +759,8 @@ class AgentLoop:
         self._parent_recorder.clear()
         request = AgentTurnRequest(
             user_text=user_text,
+            operation_scope=self._scheduler.operation_scope(self._session_manager.current_id, runtime_id, uuid4().hex),
+            session_manager=self._session_manager,
             history=lambda: self._session_manager.history,
             append_messages=lambda messages: self._session_manager.append(
                 messages

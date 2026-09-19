@@ -38,6 +38,8 @@ from mycode.teams.mailbox import TeamMailbox
 from mycode.teams.policy import build_team_tool_view, plan_is_approved
 from mycode.teams.prompts import build_team_instruction
 from mycode.teams.store import TeamStateStore
+from mycode.persistence.operations import OperationStore
+from mycode.tools.recovery import OperationRecovery
 
 
 TeamTurnExecutor = Callable[[str, tuple[ChatMessage, ...]], Awaitable[str]]
@@ -270,6 +272,11 @@ class TeamMemberRuntimeFactory:
             context_manager,
             sessions_dir=self.store.team_dir(team_id) / "sessions",
         )
+        recovery = OperationRecovery(OperationStore(self.store.workspace_root))
+        member_runtime_id = f"team:{team_id}:{member_id}:{member.session_id}"
+        report = await recovery.reconcile(member_runtime_id, sessions)
+        if report.blocked_operation_ids:
+            raise RuntimeError("成员存在未确认工具操作：" + ", ".join(report.blocked_operation_ids))
         candidate = sessions.read_candidate(member.session_id)
         sessions.activate(
             PreparedSession(candidate, candidate.messages, None, 0)
@@ -307,6 +314,8 @@ class TeamMemberRuntimeFactory:
             """
 
             current = self.store.load_team(team_id)
+            if await recovery.unresolved(member_runtime_id):
+                raise RuntimeError("成员工具效果未确认，先核查 /operations 记录再唤醒")
             latest_member = next(
                 item for item in current.members if item.agent_id == member_id
             )
@@ -372,10 +381,8 @@ class TeamMemberRuntimeFactory:
                 workspace=workspace,
                 team_actor=actor,
             )
-            runner = self.runtime_builder.build(spec)
+            runner = self.runtime_builder.build(spec, sessions=sessions)
             result = await runner.start().wait()
-            new_messages = runner.history[len(history) :]
-            sessions.append(new_messages)
             if result.status not in {
                 BackgroundTaskStatus.COMPLETED,
                 BackgroundTaskStatus.PARTIAL,

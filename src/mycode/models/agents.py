@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from uuid import uuid4
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -398,6 +399,8 @@ class IndependentAgentSpec:
     skill_arguments: str = ""
     workspace: WorkspaceAssignment | None = None
     team_actor: TeamActorContext | None = None
+    # 在委派输入首次创建时生成，后台移交和 replace(spec) 保留同一任务身份。
+    execution_id: str = field(default_factory=lambda: uuid4().hex)
 
     def __post_init__(self) -> None:
         """校验排队和运行装配依赖的全部冻结输入。

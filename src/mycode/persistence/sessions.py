@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TextIO
+from contextlib import contextmanager
+from mycode.models.operations import ToolBatchRecord
 
 from mycode.agent.conversation import Conversation
 from mycode.constants import SESSION_RETENTION_DAYS, SESSION_TITLE_MAX_CHARS
@@ -295,6 +297,11 @@ class SessionManager:
     def history(self) -> tuple[ChatMessage, ...]:
         return self._conversation.history
 
+    @property
+    def conversation(self) -> Conversation:
+        """长期团队运行与会话管理器共用消息对象，避免回合结束重复追加。"""
+        return self._conversation
+
     def _path(self, session_id: str) -> Path:
         if _SESSION_ID.fullmatch(session_id) is None:
             raise SessionError("会话 ID 格式无效")
@@ -502,6 +509,106 @@ class SessionManager:
             old_file.close()
         return session_id
 
+    @contextmanager
+    def _history_lock(self, session_id: str):
+        """串行化会话追加和尾部修复；进程退出由操作系统释放文件锁。"""
+        try:
+            lock_path = self._path(session_id).with_suffix(".lock")
+            with lock_path.open("a+b") as handle:
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"0")
+                    handle.flush()
+                handle.seek(0)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    raise SessionError("会话正在由其他执行者写入") from exc
+                try:
+                    yield
+                finally:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise SessionError(f"无法写入或修复会话文件：{exc}") from exc
+
+    def reconcile_tool_batch(self, batch: ToolBatchRecord,
+                             messages: Sequence[ChatMessage]) -> bool:
+        """按原批次身份补齐历史尾部；完整批次已经存在时不再次追加。"""
+        session_id = batch.scope.session_id
+        path = self._path(session_id)
+        if not path.exists():
+            raise SessionError("原会话文件不存在，不能补回工具历史")
+        with self._history_lock(session_id):
+            raw = path.read_bytes()
+            lines = raw.splitlines(keepends=True)
+            records: list[SessionRecord | None] = []
+            for line in lines:
+                try:
+                    records.append(self._codec.decode(line.decode("utf-8")))
+                except (SessionDecodeError, UnicodeError):
+                    records.append(None)
+            matches = [i for i, record in enumerate(records) if record is not None
+                       and record.batch_id == batch.batch_id and record.execution_id == batch.scope.execution_id]
+            if matches:
+                first = matches[0]
+                present = [records[i] for i in matches]
+                if matches != list(range(first, first + len(matches))):
+                    raise SessionError("工具批次记录不连续，不能自动修复")
+                if [r.batch_position for r in present] != list(range(len(present))):
+                    raise SessionError("工具批次顺序与保存记录冲突")
+                if present[0].message != batch.assistant:
+                    raise SessionError("历史中的工具调用与执行记录冲突")
+                for position, record in enumerate(present[1:], 1):
+                    expected = messages[position] if position < len(messages) else None
+                    if (not isinstance(record.message, ToolResultMessage)
+                            or not isinstance(expected, ToolResultMessage)
+                            or record.message.tool_call_id != expected.tool_call_id
+                            or record.message.tool_name != expected.tool_name):
+                        raise SessionError("历史工具结果与原调用不匹配")
+                if len(matches) == len(messages):
+                    return False
+                if any(record is not None for record in records[first + len(matches):]):
+                    raise SessionError("不完整工具批次位于历史中间，不能自动覆盖")
+                prefix = b"".join(lines[:first])
+            else:
+                # 新批次第一行写到一半便退出时，数据库保留的助手消息可重建尾行。
+                prefix = raw
+                if lines and records[-1] is None and not lines[-1].endswith(b"\n"):
+                    prefix = b"".join(lines[:-1])
+                elif raw and not raw.endswith(b"\n"):
+                    prefix += b"\n"
+            suffix = "".join(self._codec.encode(SessionRecord(datetime.now().astimezone(), message,
+                              batch.scope.execution_id, batch.batch_id, index)) + "\n"
+                             for index, message in enumerate(messages)).encode("utf-8")
+            active = self._current_id == session_id and self._file is not None
+            if active:
+                self._file.close()
+            temporary: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+                    temporary = handle.name
+                    handle.write(prefix + suffix)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, path)
+                temporary = None
+            finally:
+                if active:
+                    self._file = path.open("a", encoding="utf-8", newline="\n")
+                if temporary is not None:
+                    Path(temporary).unlink(missing_ok=True)
+            if active:
+                self._conversation.extend(messages)
+            return True
+
     def append(self, messages: Sequence[ChatMessage]) -> None:
         """把一批消息保存到当前会话文件，并加入内存消息历史
 
@@ -525,9 +632,10 @@ class SessionManager:
         # 严格保证先写文件再更新内存
         try:
             # 把编码后的 JSONL 文本写入 Python 文件缓冲区
-            self._file.write(serialized)
-            # 把 Python 文件缓冲区中的内容立即交给操作系统
-            self._file.flush()
+            with self._history_lock(self.current_id):
+                self._file.write(serialized)
+                # 把 Python 文件缓冲区中的内容立即交给操作系统
+                self._file.flush()
             # 避免每批消息都等待磁盘同步；会话追加后只刷新到操作系统缓存
             # os.fsync(self._file.fileno())
         except (OSError, UnicodeError) as exc:

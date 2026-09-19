@@ -25,6 +25,7 @@ from mycode.models.permissions import (
 from mycode.skills.commands import handle_skill_management
 from mycode.agents.commands import handle_agent_management
 from mycode.worktrees.commands import handle_worktree
+from mycode.commands.operations import handle_operations, OPERATIONS_USAGE
 
 _SESSION_ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
 
@@ -503,6 +504,7 @@ def create_builtin_registry() -> CommandRegistry:
         Command("plan", ("p",), "进入计划模式", "/plan [任务]", CommandType.LOCAL_UI, handle_plan),
         Command("do", (), "切换到执行模式", "/do", CommandType.LOCAL_UI, handle_do),
         Command("session", (), "查询和管理会话", "/session [list|new|resume <ID>|delete <ID>]", CommandType.LOCAL, handle_session),
+        Command("operations", (), "查询工具执行；重试复用原结果，未知效果须人工核查", OPERATIONS_USAGE, CommandType.LOCAL, handle_operations),
         Command("memory", (), "只读查看长期记忆", "/memory [list]", CommandType.LOCAL, handle_memory),
         Command("permission", (), "查询权限或切换模式", "/permission [rules|mode strict|default|allow]", CommandType.LOCAL, handle_permission),
         Command("status", ("s",), "显示当前综合状态", "/status", CommandType.LOCAL, handle_status),
