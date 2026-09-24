@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from mycode.agent.cancellation import CancellationToken
 from mycode.hooks.runtime import HookRunScope
 from mycode.models.events import AgentRunOptions
 from mycode.models.messages import AssistantMessage, ToolResultMessage
-from mycode.models.operations import OperationRecord, OperationScope, OperationState, RecoveryReport, ToolBatchRecord, operation_failure
+from mycode.models.operations import (OperationRecord, OperationScope, OperationState, RecoveryReport,
+    ToolBatchRecord, operation_failure, FileWriteExpectation, FileVerificationCandidate)
 from mycode.models.tools import ToolAccess, ToolErrorCode, ToolExecutionResult
-from mycode.persistence.operations import OperationError, OperationStore, operation_io
+from mycode.persistence.operations import OperationError, OperationStore, operation_io, _process_alive
 from mycode.persistence.sessions import SessionManager
 from mycode.tools.scheduler import ToolScheduler
 
@@ -30,6 +33,37 @@ class OperationRecovery:
 
     def __init__(self, store: OperationStore) -> None:
         self.store = store
+
+    async def file_candidates(self, scope: OperationScope, path: Path) -> tuple[FileVerificationCandidate, ...]:
+        """读取前筛选本运行同一路径的未知写入；线程未结束的只记录原因。"""
+        records = await operation_io(self.store.list_operations, runtime_id=scope.runtime_id)
+        candidates = []
+        for record in records:
+            if (record.state is not OperationState.UNKNOWN
+                    or record.call.name not in ("write_file", "edit_file")
+                    or record.scope.session_id != scope.session_id
+                    or record.scope.workspace_root != scope.workspace_root
+                    or record.scope.actor_key != scope.actor_key
+                    or record.owner_token is None):
+                continue
+            target = (scope.workspace_root / str(record.call.arguments["path"])).resolve()
+            if target != path:
+                continue
+            expected = await operation_io(self.store.file_expectation, record.operation_id, record.owner_token)
+            exited = record.owner_pid is not None and await operation_io(_process_alive, record.owner_pid) is False
+            if expected is None and record.call.name == "write_file" and exited:
+                data = str(record.call.arguments["content"]).encode("utf-8")
+                expected = FileWriteExpectation(record.operation_id, record.owner_token, record.attempt,
+                    str(path), hashlib.sha256(data).hexdigest(), len(data), True)
+            reason = None
+            if expected is None:
+                reason = "missing_expectation"
+            elif expected.target_path != str(path):
+                reason = "unavailable"
+            elif not expected.writer_finished and not exited:
+                reason = "writer_active"
+            candidates.append(FileVerificationCandidate(record, expected, reason))
+        return tuple(candidates)
 
     async def unresolved(self, runtime_id: str) -> tuple[OperationRecord, ...]:
         """检查原运行的遗留记录，返回尚未结束或效果未知的写操作。"""

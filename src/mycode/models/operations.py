@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 
 from mycode.models.messages import AssistantMessage, ToolCall
+from mycode.models.json_types import JsonObject
 from mycode.models.tools import ToolAccess, ToolErrorCode, ToolExecutionResult
 
 
@@ -94,6 +95,43 @@ class RecoveryReport:
 
     appended_batches: int
     blocked_operation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FileWriteExpectation:
+    """写线程在修改文件前保存的目标字节摘要，以及该次写入是否已结束。"""
+
+    operation_id: str
+    owner_token: str
+    attempt: int
+    target_path: str
+    expected_sha256: str
+    expected_size: int
+    writer_finished: bool = False
+
+
+@dataclass(frozen=True)
+class FileVerificationCandidate:
+    """读取前取得的原操作和文件预期；reason 非空时只能记录未确认原因。"""
+
+    record: OperationRecord
+    expectation: FileWriteExpectation | None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationVerification:
+    """一次真实文件读取对原写操作得出的核查结论。"""
+
+    verification_id: str
+    operation_id: str
+    query_operation_id: str
+    owner_token: str
+    attempt: int
+    verdict: str
+    evidence: JsonObject
+    previous_result: JsonObject | None
+    created_at: str
 
 
 def operation_failure(call: ToolCall, code: ToolErrorCode, message: str) -> ToolExecutionResult:

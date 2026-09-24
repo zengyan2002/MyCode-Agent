@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 from collections.abc import Mapping
@@ -19,6 +20,7 @@ from mycode.models.tools import (
 )
 from mycode.tools.base import ToolContext, ToolFailure, ToolOutput
 from mycode.tools.builtin.paths import WorkspacePaths
+from mycode.tools.file_journal import FileWriteJournal
 
 
 _READ_FILE = ToolDefinition(
@@ -197,7 +199,7 @@ def _slice_utf8_text(
         end if end < total_bytes else None,
     )
 
-def _write_exclusive(path: Path, content: str) -> None:
+def _write_exclusive(path: Path, content: str, journal: FileWriteJournal | None = None) -> None:
     """
     以 UTF-8 编码创建并写入一个新文件
 
@@ -209,6 +211,8 @@ def _write_exclusive(path: Path, content: str) -> None:
     """
     # open("x") 把“不覆盖已有文件”交给操作系统原子保证，避免先 exists()，再 open("w") 之间的竞态窗口。fsync 则确保报告成功前数据已经交给系统。
     #用来记录文件是否已经创建
+    if journal is not None:
+        journal.record_expected(path, content.encode("utf-8"))
     created = False
     try:
         #以独占模式打开文件
@@ -236,9 +240,13 @@ def _write_exclusive(path: Path, content: str) -> None:
             ToolErrorCode.IO_ERROR,
             "新文件无法写入",
         ) from exc
+    finally:
+        if journal is not None:
+            journal.mark_finished()
 
 #在一个 UTF-8 文本文件中查找唯一出现的一段旧文本，将它替换成新文本，并通过同目录临时文件原子替换原文件。
-def _edit_unique(path: Path, old_text: str, new_text: str) -> int:
+def _edit_unique(path: Path, old_text: str, new_text: str,
+                 journal: FileWriteJournal | None = None) -> int:
     """替换 UTF-8 文件中唯一出现的一段文本
 
     旧文本必须在文件中恰好出现一次。替换后的完整内容会先写入同目录临时
@@ -280,6 +288,8 @@ def _edit_unique(path: Path, old_text: str, new_text: str) -> int:
 
     #以新的文本内容替换旧文本内容，并转换成二进制bytes文本
     replacement = original.replace(old_text, new_text, 1).encode("utf-8")
+    if journal is not None:
+        journal.record_expected(path, replacement)
 
     #临时文件路径
     temp_path: Path | None = None
@@ -318,6 +328,8 @@ def _edit_unique(path: Path, old_text: str, new_text: str) -> int:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+        if journal is not None:
+            journal.mark_finished()
     return len(replacement)
 
 class ReadFileTool:
@@ -351,10 +363,12 @@ class ReadFileTool:
             raw_limit = arguments.get("limit_bytes")
             limit_bytes = int(raw_limit) if raw_limit is not None else None
             try:
-                cached_content = await asyncio.to_thread(
-                    context.file_cache.read_text,
-                    path,
-                )
+                if context.fresh_file_read:
+                    raw = await asyncio.to_thread(path.read_bytes)
+                    cached_content = raw.decode("utf-8")
+                    context.file_cache.invalidate(path)
+                else:
+                    cached_content = await asyncio.to_thread(context.file_cache.read_text, path)
             except UnicodeDecodeError as exc:
                 raise ToolFailure(
                     ToolErrorCode.INVALID_ENCODING,
@@ -377,6 +391,9 @@ class ReadFileTool:
                 "returned_bytes": returned_bytes,
                 "next_offset": next_offset,
             }
+            if context.fresh_file_read:
+                metadata.update(fresh_file_read=True, resolved_path=str(path),
+                                file_sha256=hashlib.sha256(raw).hexdigest())
             return ToolOutput.ok(
                 content,
                 metadata=metadata,
@@ -402,7 +419,7 @@ class WriteFileTool:
         try:
             path = paths.new_file(str(arguments["path"]))
             content = str(arguments["content"])
-            await asyncio.to_thread(_write_exclusive, path, content)
+            await asyncio.to_thread(_write_exclusive, path, content, context.file_write_journal)
             context.file_cache.invalidate(path)
             return ToolOutput.ok(
                 f"已创建 {paths.relative_path(path)}",
@@ -435,6 +452,7 @@ class EditFileTool:
                 path,
                 str(arguments["old_text"]),
                 str(arguments["new_text"]),
+                context.file_write_journal,
             )
             context.file_cache.invalidate(path)
             return ToolOutput.ok(

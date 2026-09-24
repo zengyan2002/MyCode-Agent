@@ -8,7 +8,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -18,6 +18,7 @@ from mycode.models.messages import AssistantMessage, ToolCall
 from mycode.models.operations import (
     ClaimKind, ClaimResult, OperationRecord, OperationScope, OperationState,
     ResolutionVerdict, ToolBatchRecord, operation_failure,
+    FileWriteExpectation, FileVerificationCandidate, OperationVerification,
 )
 from mycode.models.tools import ToolAccess, ToolErrorCode, ToolExecutionResult
 from mycode.persistence.session_codec import SessionCodec, SessionRecord
@@ -101,7 +102,7 @@ class OperationStore:
             with self._db() as db:
                 db.execute("PRAGMA journal_mode=WAL")
                 version = db.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1):
+                if version not in (0, 1, 2):
                     raise OperationError("工具执行数据库版本不受支持")
                 db.executescript("""
                     BEGIN IMMEDIATE;
@@ -142,7 +143,24 @@ class OperationStore:
                         verdict TEXT NOT NULL, note TEXT NOT NULL, previous_result_json TEXT, created_at TEXT NOT NULL
                     );
                     CREATE INDEX IF NOT EXISTS execution_runtime ON executions(runtime_id);
-                    PRAGMA user_version=1;
+                    CREATE TABLE IF NOT EXISTS file_write_expectations (
+                        operation_id TEXT NOT NULL REFERENCES tool_operations,
+                        owner_token TEXT NOT NULL, attempt INTEGER NOT NULL,
+                        target_path TEXT NOT NULL, expected_sha256 TEXT NOT NULL,
+                        expected_size INTEGER NOT NULL, writer_finished INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL, finished_at TEXT,
+                        PRIMARY KEY(operation_id,owner_token)
+                    );
+                    CREATE TABLE IF NOT EXISTS operation_verifications (
+                        verification_id TEXT PRIMARY KEY,
+                        operation_id TEXT NOT NULL REFERENCES tool_operations,
+                        query_operation_id TEXT NOT NULL REFERENCES tool_operations,
+                        owner_token TEXT NOT NULL, attempt INTEGER NOT NULL,
+                        verdict TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                        previous_result_json TEXT, created_at TEXT NOT NULL,
+                        UNIQUE(operation_id,query_operation_id,owner_token)
+                    );
+                    PRAGMA user_version=2;
                     COMMIT;
                 """)
         except OSError as exc:
@@ -210,6 +228,113 @@ class OperationStore:
         """读取一个已登记工具步骤及它保存的结果。"""
         with self._db() as db:
             return self._get(db, operation_id)
+
+    def save_file_expectation(self, value: FileWriteExpectation) -> None:
+        """线程真正修改文件前保存预期内容；领取身份改变后不再允许写入。"""
+        with self._db(write=True) as db:
+            record = self._get(db, value.operation_id)
+            if (record.owner_token != value.owner_token or record.attempt != value.attempt
+                    or record.state not in (OperationState.RUNNING, OperationState.UNKNOWN)):
+                raise OperationError("文件写入已不属于当前执行者")
+            db.execute("INSERT INTO file_write_expectations VALUES (?,?,?,?,?,?,0,?,NULL)",
+                       (value.operation_id, value.owner_token, value.attempt, value.target_path,
+                        value.expected_sha256, value.expected_size, _now()))
+
+    def finish_file_writer(self, operation_id: str, owner_token: str) -> None:
+        """只标记这一次线程的文件操作已结束，不把未知操作改为成功。"""
+        with self._db(write=True) as db:
+            db.execute("UPDATE file_write_expectations SET writer_finished=1,finished_at=? "
+                       "WHERE operation_id=? AND owner_token=?", (_now(), operation_id, owner_token))
+
+    def file_expectation(self, operation_id: str, owner_token: str) -> FileWriteExpectation | None:
+        with self._db() as db:
+            row = db.execute("SELECT * FROM file_write_expectations WHERE operation_id=? AND owner_token=?",
+                             (operation_id, owner_token)).fetchone()
+        if row is None:
+            return None
+        return FileWriteExpectation(row["operation_id"], row["owner_token"], row["attempt"],
+            row["target_path"], row["expected_sha256"], row["expected_size"], bool(row["writer_finished"]))
+
+    def complete_verification_read(self, query_operation_id: str, owner_token: str,
+                                   result: ToolExecutionResult,
+                                   candidates: tuple[FileVerificationCandidate, ...]) -> ToolExecutionResult:
+        """一起保存真实读取结果与自动确认；人工已处理的原操作不会被覆盖。"""
+        with self._db(write=True) as db:
+            query = self._get(db, query_operation_id)
+            if query.state is OperationState.COMPLETED and query.owner_token == owner_token:
+                return query.result
+            if query.state is not OperationState.RUNNING or query.owner_token != owner_token:
+                raise OperationError("当前调用不再持有核查读取执行权")
+            summaries = []
+            for candidate in candidates:
+                old = candidate.record
+                if (old.scope.runtime_id != query.scope.runtime_id
+                        or old.scope.session_id != query.scope.session_id
+                        or old.scope.workspace_root != query.scope.workspace_root
+                        or old.scope.actor_key != query.scope.actor_key):
+                    raise OperationError("核查读取与原操作不属于同一运行、目录或身份")
+                current = self._get(db, old.operation_id)
+                if (current.state is not OperationState.UNKNOWN or current.owner_token != old.owner_token
+                        or current.attempt != old.attempt or current.arguments_hash != old.arguments_hash
+                        or current.scope != old.scope):
+                    continue
+                expected = candidate.expectation
+                evidence = {"rule": "full_file_sha256", "path": expected.target_path if expected else None,
+                    "expected_sha256": expected.expected_sha256 if expected else None,
+                    "expected_size": expected.expected_size if expected else None,
+                    "actual_sha256": result.metadata.get("file_sha256"),
+                    "actual_size": result.metadata.get("total_bytes"),
+                    "reason": candidate.reason or result.error_message}
+                verdict = candidate.reason or "unavailable"
+                if candidate.reason is None and expected is not None and result.success:
+                    fresh = result.metadata.get("fresh_file_read") is True
+                    matching = (fresh and result.metadata.get("resolved_path") == expected.target_path
+                        and evidence["actual_sha256"] == expected.expected_sha256
+                        and evidence["actual_size"] == expected.expected_size)
+                    verdict = "matched" if matching else "different"
+                vid = "verify-" + uuid4().hex
+                previous = _json(asdict(current.result)) if current.result else None
+                db.execute("INSERT INTO operation_verifications VALUES (?,?,?,?,?,?,?,?,?)",
+                    (vid, old.operation_id, query_operation_id, old.owner_token, old.attempt,
+                     verdict, _json(evidence), previous, _now()))
+                summary = {"verification_id": vid, "operation_id": old.operation_id,
+                           "verdict": verdict, "source": "file_verification"}
+                summaries.append(summary)
+                if verdict == "matched":
+                    confirmed = replace(result, tool_call_id=current.call.id, tool_name=current.call.name,
+                        content="程序核查确认目标文件的完整内容已满足原操作要求；未重新执行写入。",
+                        metadata={**summary, "query_operation_id": query_operation_id, "evidence": evidence},
+                        timed_out=False, truncated=False, original_size_bytes=0, duration_ms=0)
+                    db.execute("UPDATE tool_operations SET state='completed',result_json=?,"
+                               "resolution_source='file_verification',updated_at=? WHERE operation_id=?",
+                               (_json(asdict(confirmed)), _now(), old.operation_id))
+            result = replace(result, metadata={**result.metadata, "operation_verifications": summaries})
+            db.execute("UPDATE tool_operations SET state='completed',result_json=?,execution_started=1,"
+                       "resolution_source='tool',updated_at=? WHERE operation_id=?",
+                       (_json(asdict(result)), _now(), query_operation_id))
+            return result
+
+    @staticmethod
+    def _verification(row) -> OperationVerification:
+        return OperationVerification(row["verification_id"], row["operation_id"], row["query_operation_id"],
+            row["owner_token"], row["attempt"], row["verdict"], json.loads(row["evidence_json"]),
+            json.loads(row["previous_result_json"]) if row["previous_result_json"] else None, row["created_at"])
+
+    def verifications(self, operation_id: str) -> tuple[OperationVerification, ...]:
+        """返回这次操作的自动核查依据，保留原来的失败结果。"""
+        with self._db() as db:
+            return tuple(self._verification(r) for r in db.execute(
+                "SELECT * FROM operation_verifications WHERE operation_id=? ORDER BY created_at,verification_id",
+                (operation_id,)))
+
+    def verification_summary(self, runtime_id: str) -> tuple[OperationVerification, ...]:
+        """返回本运行已自动确认且仍有效的依据，供恢复后的模型了解当前状态。"""
+        with self._db() as db:
+            return tuple(self._verification(r) for r in db.execute(
+                "SELECT v.* FROM operation_verifications v JOIN tool_operations o USING(operation_id) "
+                "JOIN executions e USING(execution_id) WHERE e.runtime_id=? AND v.verdict='matched' "
+                "AND o.state='completed' AND o.resolution_source='file_verification' "
+                "AND v.owner_token=o.owner_token ORDER BY v.created_at,v.verification_id", (runtime_id,)))
 
     def list_operations(self, *, session_id=None, runtime_id=None) -> tuple[OperationRecord, ...]:
         """查询当前项目的记录，可按归属会话或具体运行过滤。"""

@@ -14,6 +14,7 @@ from mycode.tools.file_cache import AgentFileCache
 from mycode.worktrees.binding import WorkspaceBinding, shared_workspace_binding
 
 if TYPE_CHECKING:
+    from mycode.tools.file_journal import FileWriteJournal
     from mycode.models.teams import TeamActorContext
     from mycode.skills.resources import SkillResourceAccess
     from mycode.skills.load_tool import SkillLoadRouter
@@ -55,6 +56,10 @@ class ToolContext:
         default_factory=ToolActivationState
     )
     team_actor: TeamActorContext | None = None
+    # Executor 给一次文件写入的独立上下文设置，不与其他工具调用共享。
+    file_write_journal: FileWriteJournal | None = None
+    # 自动核查必须读取磁盘，不能使用先前读取留下的文件正文缓存。
+    fresh_file_read: bool = False
 
     def __post_init__(self) -> None:
         """校验工具上下文，并把旧的绝对路径参数转换成共享绑定。

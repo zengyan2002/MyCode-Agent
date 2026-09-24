@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 
 from mycode.models.messages import ToolCall
 from mycode.models.operations import OperationScope, OperationState, operation_failure
@@ -11,6 +12,10 @@ from mycode.models.tools import ToolAccess, ToolErrorCode, ToolExecutionResult
 from mycode.persistence.operations import OperationError, OperationStore, operation_io
 from mycode.tools.base import ToolContext, ToolFailure, ToolOutput
 from mycode.tools.registry import ToolRegistry
+from mycode.tools.builtin.files import ReadFileTool, WriteFileTool, EditFileTool
+from mycode.tools.builtin.paths import WorkspacePaths
+from mycode.tools.file_journal import FileWriteJournal
+from mycode.models.tools import ToolSource
 
 # 负责校验并执行一个工具调用，然后返回包含错误信息和耗时的统一结果
 # 多个工具如何并发、排序和取消，由 ToolScheduler 负责
@@ -55,7 +60,8 @@ class ToolExecutor:
         return self._context
 
     async def execute(self, call: ToolCall, *, operation_id: str,
-                      scope: OperationScope, owner_token: str) -> ToolExecutionResult:
+                      scope: OperationScope, owner_token: str,
+                      verification_only: bool = False) -> ToolExecutionResult:
         """执行一次模型工具调用。
 
         Args:
@@ -111,11 +117,37 @@ class ToolExecutor:
             else self._timeout_seconds
         )
         cancelled = False
+        context = self._context
+        candidates = ()
+        builtin = self._registry.source_for(call.name) is ToolSource.BUILTIN
+        if builtin and isinstance(tool, (WriteFileTool, EditFileTool)):
+            context = replace(context, file_write_journal=FileWriteJournal(
+                self.store, operation_id, owner_token, record.attempt))
+        verifying_read = verification_only and builtin and isinstance(tool, ReadFileTool)
+        if verifying_read:
+            context = replace(context, fresh_file_read=True)
         try:
             # asyncio.timeout 会先向工具协程注入 CancelledError，使命令工具
             # 有机会终止进程树，再由下面的分支转换成普通超时结果。
             async with asyncio.timeout(timeout_seconds):
-                output = await tool.execute(call.arguments, self._context)
+                if verifying_read:
+                    from mycode.tools.recovery import OperationRecovery
+                    path, _ = WorkspacePaths(context.workspace_root).readable_file(
+                        str(call.arguments["path"]), context.user_memory_root, context.skill_resources)
+                    candidates = await OperationRecovery(self.store).file_candidates(scope, path)
+                    # 只有本地真实的文件写工具才有可自动确认的语义。
+                    candidates = tuple(c for c in candidates if
+                        isinstance(self._registry.get(c.record.call.name), (WriteFileTool, EditFileTool))
+                        and self._registry.source_for(c.record.call.name) is ToolSource.BUILTIN)
+                output = await tool.execute(call.arguments, context)
+        except OperationError:
+            try:
+                await operation_io(self.store.mark_unknown, operation_id, owner_token,
+                                   "文件操作或核查记录保存失败", None)
+            except OperationError:
+                pass  # 数据库仍不可用时保留原领取记录，不允许重新领取。
+            return operation_failure(call, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                                     f"文件操作或核查记录未能保存，已停止执行。操作：{operation_id}")
         except TimeoutError:
             output = ToolOutput.fail(
                 ToolErrorCode.TIMEOUT,
@@ -146,6 +178,9 @@ class ToolExecutor:
                                    result.error_message or "工具效果无法确认", result)
                 return operation_failure(call, ToolErrorCode.OPERATION_UNKNOWN,
                     f"工具可能已经生效，结果无法确认。操作：{operation_id}。{result.error_message}")
+            if verifying_read and not cancelled:
+                return await operation_io(self.store.complete_verification_read,
+                                          operation_id, owner_token, result, candidates)
             await operation_io(self.store.complete, operation_id, owner_token, result, started=True)
         except (OperationError, asyncio.CancelledError):
             # 本体已结束，提交线程可能已经成功；先查记录，不能覆盖已提交结果。
