@@ -593,7 +593,8 @@ class AgentLoop:
         """读取本项目操作及用户核查记录，不访问其他项目数据库。"""
         record = await operation_io(self._scheduler.store.recover_orphan, operation_id)
         notes = await operation_io(self._scheduler.store.resolutions, operation_id)
-        return record, notes
+        verifications = await operation_io(self._scheduler.store.verifications, operation_id)
+        return record, notes, verifications
 
     async def resolve_operation(self, operation_id: str, verdict: ResolutionVerdict, note: str):
         """保存用户对未知工具效果的实际核查，不执行工具。"""

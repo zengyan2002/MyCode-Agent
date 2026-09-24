@@ -86,6 +86,16 @@ class ModelCallBudget:
         self._max_model_calls = max_model_calls
         self._started: dict[int, ModelCallPurpose] = {}
         self._finished: set[int] = set()
+        self._verification_active = False
+        self.verification_used = 0
+
+    def enter_verification(self) -> None:
+        """后续请求同时消费本次用户请求剩余的三次核查额度。"""
+        self._verification_active = True
+
+    def leave_verification(self) -> None:
+        """恢复普通预算；保留核查用量，防止再次进入时重置。"""
+        self._verification_active = False
 
     @property
     def max_model_calls(self) -> int:
@@ -103,7 +113,8 @@ class ModelCallBudget:
     def remaining_model_calls(self) -> int:
         """返回当前运行尚可发给 Provider 的请求数。"""
 
-        return self._max_model_calls - self.used_model_calls
+        remaining = self._max_model_calls - self.used_model_calls
+        return min(remaining, 3 - self.verification_used) if self._verification_active else remaining
 
     @property
     def finalization_required(self) -> bool:
@@ -141,6 +152,8 @@ class ModelCallBudget:
             raise RuntimeError("最后一次模型调用已为正式回答保留")
         number = self.used_model_calls + 1
         self._started[number] = purpose
+        if self._verification_active:
+            self.verification_used += 1
         return number
 
     def finish(

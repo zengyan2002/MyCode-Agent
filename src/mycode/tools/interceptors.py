@@ -137,6 +137,9 @@ class PlanOnlyInterceptor:
             非 Plan 模式或 READ 工具返回放行；其他情况返回 BLOCKED。
         """
 
+        if context.options.verification_only and context.invocation.access is ToolAccess.WRITE:
+            return InterceptionDecision.deny(ToolErrorCode.BLOCKED,
+                "原写操作效果尚未确认，当前只允许读取证据；关闭 Plan 不能解除核查限制")
         if (
             context.options.plan_only
             and context.invocation.access is ToolAccess.WRITE

@@ -27,6 +27,8 @@ class AgentRunOptions:
     max_read_concurrency: int = DEFAULT_MAX_READ_CONCURRENCY
     # 整条用户请求最多运行多少秒；None表示不设置整体超时。
     overall_timeout_seconds: float | None = None
+    # Runtime 为未知写操作发起只读核查，不改变用户原有的 Plan 选择。
+    verification_only: bool = False
 
     def __post_init__(self) -> None:
         """拒绝无法作为运行限制使用的布尔值、非数值和非正数。

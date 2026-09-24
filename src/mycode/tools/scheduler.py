@@ -285,7 +285,8 @@ class ToolScheduleSession:
                     return result
             entered_executor = True
             result = await self._executor.execute(invocation.call, operation_id=invocation.operation_id,
-                                                  scope=self._scope, owner_token=token)
+                                                  scope=self._scope, owner_token=token,
+                                                  verification_only=self._options.verification_only)
             # observer 只观察真正经过 Executor 的调用；被 Plan 模式拦截的
             # 调用没有执行事实，不应被审计为“已执行”。
             await notify_observers(

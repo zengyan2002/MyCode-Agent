@@ -12,6 +12,7 @@ from mycode.agent.cancellation import (
     CancellationToken,
 )
 from mycode.agent.progress import ProgressMonitor, PROGRESS_NOTICE, PROGRESS_REPLAN
+from mycode.agent.verification import OperationVerificationPhase
 from mycode.constants import (
     PROGRESS_TRACE_MAX_STEPS,
     PROGRESS_WARN_AFTER_ROUNDS,
@@ -79,6 +80,7 @@ from mycode.models.provider import (
     ToolChoice,
 )
 from mycode.models.tools import (
+    ToolAccess,
     ToolErrorCode,
     ToolExecutionResult,
     ToolActivationState,
@@ -91,7 +93,7 @@ from mycode.providers.runner import (
 from mycode.skills.runtime import SkillRuntime
 from mycode.tools.registry import ToolRegistry
 from mycode.tools.scheduler import ToolScheduleSession, ToolScheduler
-from mycode.models.operations import OperationScope, ToolBatchRecord
+from mycode.models.operations import OperationScope, OperationState, ToolBatchRecord
 from mycode.persistence.operations import operation_io
 from mycode.persistence.sessions import SessionManager
 from mycode.tools.recovery import OperationRecovery
@@ -324,6 +326,9 @@ class AgentTurnRunner:
             definitions, resolved_view = self._registry.definitions_for(
                 requested_view
             )
+            if run.options.verification_only:
+                definitions = tuple(d for d in definitions if d.access is ToolAccess.READ)
+                resolved_view = resolved_view.resolved(frozenset(d.name for d in definitions))
         return (
             ProviderRequest(
                 messages=messages,
@@ -579,18 +584,42 @@ class AgentTurnRunner:
         batch_number = 0
         current_result_indexes: set[int] = set()
         active_model_call_number: int | None = None
+        original_options = run.options
+        verification: OperationVerificationPhase | None = None
+        recovery = OperationRecovery(self._scheduler.store)
+
+        def verification_reply() -> FinalReplyEvent:
+            # 同时写入会话与返回给用户，不能只显示未持久化的结论。
+            report = redact_secrets(verification.report(), self._secrets)
+            message = AssistantMessage((TextBlock(report),))
+            run.append_messages((message,))
+            turn_messages.append(message)
+            if run.completed_turn is not None:
+                try:
+                    run.completed_turn(tuple(turn_messages))
+                except RuntimeError:
+                    pass
+            return FinalReplyEvent(report, budget.used_model_calls)
 
         try:
             await operation_io(self._scheduler.store.begin_execution, run.operation_scope)
-            blocked = await OperationRecovery(self._scheduler.store).unresolved(run.operation_scope.runtime_id)
+            blocked = await recovery.unresolved(run.operation_scope.runtime_id)
             if blocked:
-                run = replace(run, options=replace(run.options, plan_only=True))
+                if any(r.state is not OperationState.UNKNOWN for r in blocked):
+                    yield self._safe_error(AgentErrorCode.OPERATION_UNRESOLVED,
+                        "原操作仍可能正在执行，不能开始自动核查或重复执行。", budget.used_model_calls)
+                    return
+                verification = OperationVerificationPhase(blocked)
+                budget.enter_verification()
+                run = replace(run, options=replace(original_options, verification_only=True))
                 yield AgentWarningEvent("原工具结果未确认，当前仅允许只读核查：" +
                                         ", ".join(record.operation_id for record in blocked))
             if run.emit_user_event:
                 yield UserMessageEvent(run.user_text)
             if not run.user_already_in_history:
                 run.append_messages((user_message,))
+            confirmed = await operation_io(self._scheduler.store.verification_summary,
+                                           run.operation_scope.runtime_id)
             async with CancellationController(
                 run.cancellation,
                 run.options.overall_timeout_seconds,
@@ -609,6 +638,10 @@ class AgentTurnRunner:
                             run.append_messages(external_messages)
                             turn_messages.extend(external_messages)
                         candidate = run.history()
+                        if verification is not None and (
+                                budget.remaining_model_calls <= 0 or verification.stop_reason):
+                            yield verification_reply()
+                            return
                         try:
                             memory_runtime = run.load_memory_runtime()
                         except MyCodeError as exc:
@@ -620,6 +653,15 @@ class AgentTurnRunner:
                                 )
                             )
                         preview_runtime = self._runtime_for(run, preview=True)
+                        verification_runtime = ()
+                        if verification is not None:
+                            verification_runtime = (verification.instruction(),)
+                        if confirmed:
+                            verification_runtime += (RuntimeInstruction(RuntimeInstructionKind.RUNTIME_NOTICE,
+                                "以下原操作已经由程序根据完整文件内容确认，无需重做；这不是原工具返回的成功：\n"
+                                + "\n".join(f"{v.operation_id}：{v.evidence['path']}（核查 {v.verification_id}）"
+                                            for v in confirmed)),)
+                        preview_runtime = (*preview_runtime, *verification_runtime)
                         deferred = (
                             None
                             if run.fixed_runtime is not None
@@ -694,7 +736,7 @@ class AgentTurnRunner:
                             ),
                             run.hook_scope,
                         )
-                        runtime = self._runtime_for(run, preview=False)
+                        runtime = (*self._runtime_for(run, preview=False), *verification_runtime)
                         # 此提示属于即将取得的模型响应；紧急压缩重试仍需保留。
                         request_progress_instruction = pending_progress_instruction
                         pending_progress_instruction = None
@@ -738,13 +780,13 @@ class AgentTurnRunner:
                                     controller.token,
                                 ):
                                     if isinstance(event, ProviderThinkingDelta):
-                                        if not finalizing:
+                                        if not finalizing and verification is None:
                                             yield ThinkingDeltaEvent(
                                                 model_call_number,
                                                 event.text,
                                             )
                                     elif isinstance(event, ProviderTextDelta):
-                                        if not finalizing:
+                                        if not finalizing and verification is None:
                                             yield ModelTextDeltaEvent(
                                                 model_call_number,
                                                 event.text,
@@ -766,6 +808,10 @@ class AgentTurnRunner:
                                     record.purpose,
                                 )
                                 if finalizing:
+                                    if verification is not None:
+                                        verification.stop_reason = "核查请求超出上下文限制，剩余额度不足"
+                                        yield verification_reply()
+                                        return
                                     yield self._safe_error(
                                         AgentErrorCode.MAX_MODEL_CALLS,
                                         "最后一次模型调用因上下文超限失败，已没有额度再次生成正式报告",
@@ -834,7 +880,7 @@ class AgentTurnRunner:
                                     ),
                                     run.hook_scope,
                                 )
-                                runtime = self._runtime_for(run, preview=False)
+                                runtime = (*self._runtime_for(run, preview=False), *verification_runtime)
                                 if deferred is not None:
                                     runtime = (*runtime, deferred)
                                 finalizing = budget.finalization_required
@@ -908,6 +954,10 @@ class AgentTurnRunner:
                                 budget.used_model_calls,
                             )
                             return
+                        if verification is not None and (
+                                finalizing or completed.stop_reason is ModelStopReason.END_TURN):
+                            yield verification_reply()
+                            return
                         if finalizing:
                             report = parse_final_report(assistant.text)
                             if report is None:
@@ -978,7 +1028,7 @@ class AgentTurnRunner:
                             hook_scope=run.hook_scope,
                             visible_tool_names=(
                                 tool_view.visible_tool_names
-                                if run.skill_runtime is not None
+                                if run.skill_runtime is not None or run.options.verification_only
                                 else None
                             ),
                         )
@@ -1031,13 +1081,34 @@ class AgentTurnRunner:
                         )
                         turn_messages.extend(committed)
                         if any(result.error_code in {
-                            ToolErrorCode.OPERATION_UNKNOWN, ToolErrorCode.OPERATION_STORAGE_ERROR,
+                            ToolErrorCode.OPERATION_STORAGE_ERROR,
                             ToolErrorCode.OPERATION_IN_PROGRESS, ToolErrorCode.OPERATION_CONFLICT,
                         } for result in results):
                             yield self._safe_error(AgentErrorCode.OPERATION_UNRESOLVED,
                                 "工具效果或执行记录无法确认，已停止当前任务。使用 /operations list 查看。",
                                 budget.used_model_calls)
                             return
+                        if verification is not None:
+                            verification.observe(invocations, results)
+                            blocked = await recovery.unresolved(run.operation_scope.runtime_id)
+                            confirmed = await operation_io(self._scheduler.store.verification_summary,
+                                                           run.operation_scope.runtime_id)
+                            verification.records = blocked
+                            if not blocked:
+                                verification = None
+                                budget.leave_verification()
+                                run = replace(run, options=original_options)
+                                yield AgentWarningEvent("程序已核对原文件操作的完整内容，恢复原任务权限；未重复执行写入。")
+                        elif any(r.error_code is ToolErrorCode.OPERATION_UNKNOWN for r in results):
+                            blocked = await recovery.unresolved(run.operation_scope.runtime_id)
+                            if not blocked or any(r.state is not OperationState.UNKNOWN for r in blocked):
+                                yield self._safe_error(AgentErrorCode.OPERATION_UNRESOLVED,
+                                    "原操作仍可能在运行，已停止当前任务。", budget.used_model_calls)
+                                return
+                            verification = OperationVerificationPhase(blocked)
+                            budget.enter_verification()
+                            run = replace(run, options=replace(original_options, verification_only=True))
+                            yield AgentWarningEvent("写操作效果未知，正在使用只读工具自动核查；不会自动重试。")
                         if decision.message is not None:
                             pending_progress_instruction = RuntimeInstruction(
                                 RuntimeInstructionKind.RUNTIME_NOTICE, decision.message,

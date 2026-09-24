@@ -25,8 +25,9 @@ async def handle_operations(context: CommandContext) -> CommandResult:
             text = "\n".join(f"{r.operation_id}  {r.state.value}  {r.call.name}  {r.scope.runtime_id}"
                              for r in records) or "没有工具执行记录"
         elif len(args) == 2 and args[0] == "show":
-            record, notes = await context.agent.inspect_operation(args[1])
-            text = json.dumps({"operation": asdict(record), "resolutions": notes},
+            record, notes, verifications = await context.agent.inspect_operation(args[1])
+            text = json.dumps({"operation": asdict(record), "resolutions": notes,
+                               "verifications": [asdict(v) for v in verifications]},
                               ensure_ascii=False, indent=2, default=str)
         elif len(args) == 2 and args[0] == "retry":
             result = await context.agent.retry_operation(args[1], context.cancellation,
