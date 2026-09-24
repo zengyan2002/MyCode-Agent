@@ -1089,7 +1089,11 @@ class AgentTurnRunner:
                                 budget.used_model_calls)
                             return
                         if verification is not None:
-                            verification.observe(invocations, results)
+                            evidence = []
+                            for pending in verification.records:
+                                evidence.extend(await operation_io(self._scheduler.store.verifications,
+                                                                   pending.operation_id))
+                            verification.observe(invocations, results, tuple(evidence))
                             blocked = await recovery.unresolved(run.operation_scope.runtime_id)
                             confirmed = await operation_io(self._scheduler.store.verification_summary,
                                                            run.operation_scope.runtime_id)

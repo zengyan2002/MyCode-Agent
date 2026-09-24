@@ -312,6 +312,10 @@ class OperationStore:
             db.execute("UPDATE tool_operations SET state='completed',result_json=?,execution_started=1,"
                        "resolution_source='tool',updated_at=? WHERE operation_id=?",
                        (_json(asdict(result)), _now(), query_operation_id))
+            for execution_id in {c.record.scope.execution_id for c in candidates}:
+                db.execute("UPDATE executions SET state=CASE WHEN owner_released=1 THEN 'finished' ELSE 'active' END "
+                           "WHERE execution_id=? AND NOT EXISTS (SELECT 1 FROM tool_operations "
+                           "WHERE execution_id=? AND state!='completed')", (execution_id, execution_id))
             return result
 
     @staticmethod

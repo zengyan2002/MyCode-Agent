@@ -2,7 +2,7 @@
 
 import json
 
-from mycode.models.operations import OperationRecord
+from mycode.models.operations import OperationRecord, OperationVerification
 from mycode.models.prompts import RuntimeInstruction, RuntimeInstructionKind
 from mycode.models.tools import ToolExecutionResult, ToolInvocation
 
@@ -29,7 +29,8 @@ class OperationVerificationPhase:
             + json.dumps(operations, ensure_ascii=False))
 
     def observe(self, invocations: tuple[ToolInvocation, ...],
-                results: tuple[ToolExecutionResult, ...]) -> None:
+                results: tuple[ToolExecutionResult, ...],
+                verifications: tuple[OperationVerification, ...] = ()) -> None:
         """记录查询事实；全部重复或有查询失败时结束，不解析模型的成功断言。"""
         redundant = bool(results)
         for invocation, result in zip(invocations, results, strict=True):
@@ -42,12 +43,15 @@ class OperationVerificationPhase:
             # 正文是外部查询材料，只展示有限摘要，不把其中的“成功”升级为核查结论。
             detail = result.content[:600] if result.success else result.error_message
             self.observations.append(f"查询 {result.tool_name}：{detail or '没有返回正文'}")
-            for evidence in result.metadata.get("operation_verifications", []):
+            # 只展示数据库登记的程序判定，不能信任远程工具自带的同名 metadata。
+            for evidence in verifications:
+                if evidence.query_operation_id != invocation.operation_id:
+                    continue
                 labels = {"matched": "完整内容符合预期", "different": "完整内容与预期不同",
                     "writer_active": "原写入尚未确认结束", "missing_expectation": "缺少完整预期内容记录",
                     "unavailable": "没有取得可确认的文件证据"}
-                self.observations.append(f"程序核查 {evidence['operation_id']}："
-                                         + labels.get(evidence["verdict"], evidence["verdict"]))
+                self.observations.append(f"程序核查 {evidence.operation_id}："
+                                         + labels.get(evidence.verdict, evidence.verdict))
             if not result.success:
                 self.stop_reason = "查询失败，不能确认原操作是否已生效"
         if redundant:

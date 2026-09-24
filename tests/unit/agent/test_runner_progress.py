@@ -136,6 +136,15 @@ async def test_fixed_runtime_filters_parent_progress_and_keeps_other_notices(tmp
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["cancel", "deadline", "close", "exception"])
 async def test_aborted_tool_round_is_not_observed(tmp_path, monkeypatch, ending):
+    import asyncio
+    from mycode.agent.cancellation import CancellationController, CancellationReason
+    tool_started = asyncio.Event()
+    if ending == "deadline":
+        # 只验证截止时间发生在工具期间的收尾；不把机器启动耗时算进 50ms 假设。
+        async def after_tool_start(self):
+            await tool_started.wait()
+            self.cancel(CancellationReason.DEADLINE)
+        monkeypatch.setattr(CancellationController, "_watch_deadline", after_tool_start)
     observed = []
     original = ProgressMonitor.observe_round
 
@@ -165,6 +174,7 @@ async def test_aborted_tool_round_is_not_observed(tmp_path, monkeypatch, ending)
             options=AgentRunOptions(overall_timeout_seconds=0.05 if ending == "deadline" else None))
         async for event in stream:
             if isinstance(event, ToolStartedEvent):
+                tool_started.set()
                 if ending == "cancel":
                     token.cancel()
                 elif ending == "close":
