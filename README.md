@@ -229,7 +229,44 @@ Plan 只读约束
 
 文件工具会解析真实路径并拒绝绝对路径、`..` 和符号链接逃逸。权限规则支持精确匹配与 glob；越接近当前项目的规则优先级越高，同级冲突时拒绝优先。
 
-> **重要：** `execute_command` 的工作目录固定在项目中，但它不是操作系统级沙箱。获准执行的 Shell 命令仍可能访问工作区之外的资源。处理不可信项目时，应结合最小权限、容器或独立受控环境。
+默认 `sandbox.backend: local` 保留宿主 Shell 行为，仅设置项目工作目录，不提供操作系统隔离。需要隔离内置 `execute_command` 时，可以显式启用下面的 Docker 模式。
+
+## Docker 命令沙箱
+
+Agent、模型连接和 SQLite 留在宿主，只把内置 `execute_command` 放进本机 Linux 容器。Skill 脚本、Hook 和 MCP 进程不在这项隔离范围内；文件工具仍在宿主工作区执行。
+
+先启动 Docker 的 Linux 引擎，在仓库根目录构建镜像。构建可能需要联网下载公开依赖，构建上下文只使用 `sandbox/docker`，不要改成整个项目：
+
+```bash
+docker build -t mycode-shell-sandbox:v1 sandbox/docker
+```
+
+然后在项目的 `config.yaml` 添加：
+
+```yaml
+sandbox:
+  backend: docker
+  image: mycode-shell-sandbox:v1
+```
+
+重新启动 MyCode 后，界面和模型请求会说明实际执行环境。只支持本机 Docker endpoint 和带 `mycode.sandbox.protocol=v1` 标签、没有额外 VOLUME 的镜像。引擎或镜像不可用时直接报错，不会退回宿主执行，也不会自动拉取镜像。
+
+每次命令都复制当前工作区的普通文件到独立输入目录，再在容器 `/workspace` 中使用 `/bin/sh` 执行。输入挂载只读，工作目录可写，容器断网，以非 root 用户运行，并限制 CPU、内存和进程数。依赖要预装在镜像里；Windows PowerShell 命令不能直接用于容器。
+
+容器内的修改不会自动写回宿主，也不会跨调用保留。典型流程是：`edit_file` 修改宿主源码 → `execute_command` 在新副本运行 `python -m pytest` → Agent 读取测试结果。需要保留的源码修改继续使用宿主文件工具。
+
+副本排除 `.env*`、`.git`、`.mycode`、实际加载的配置文件、常见凭证目录、依赖缓存及链接文件；普通文件中出现已知配置密钥原文时也会排除该文件。这不是未知秘密扫描器，其他私有数据可用 `sandbox.exclude` 追加排除。副本默认最多 128MiB、10000 个文件；容器默认 1 CPU、1024MiB 内存、128 个进程，工作目录 256MiB，输出最多保留 16MiB。完整字段见 `config.example.yaml`。
+
+取消或超时会先删除本次容器，再回收客户端进程。宿主异常退出时，容器可能继续运行，直到下一次恢复清理；本版没有外部看门狗。`.mycode/sandboxes/<ID>/record.json` 保存容器名称、归属和清理状态。恢复只处理确认原进程已退出的本项目记录，不做全局 prune，也不自动重跑结果未知的 Shell 操作。
+
+如果 Docker 失联或清理失败，应先恢复引擎，再启动 MyCode 核查残留。创建请求结果未知且查不到容器时，记录仍保留，需要人工核查引擎中的请求是否结束；不能把暂时查不到当成已清理。操作是否重试仍遵循 `/operations` 的核查流程。
+
+真实引擎测试需显式开启（未开启时会跳过，不能算验收通过）：
+
+```powershell
+$env:MYCODE_RUN_DOCKER_TESTS = '1'
+python -m pytest -q tests/integration/test_docker_command_sandbox.py
+```
 
 ## 项目结构
 

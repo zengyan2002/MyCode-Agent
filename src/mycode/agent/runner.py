@@ -92,6 +92,7 @@ from mycode.providers.runner import (
 )
 from mycode.skills.runtime import SkillRuntime
 from mycode.tools.registry import ToolRegistry
+from mycode.tools.builtin.command import ExecuteCommandTool
 from mycode.tools.scheduler import ToolScheduleSession, ToolScheduler
 from mycode.models.operations import OperationScope, OperationState, ToolBatchRecord
 from mycode.persistence.operations import operation_io
@@ -288,6 +289,12 @@ class AgentTurnRunner:
             返回视图中的 visible_tool_names 复查模型调用。
         """
 
+        command_tool = self._registry.get("execute_command")
+        if isinstance(command_tool, ExecuteCommandTool) and command_tool.runtime_notice:
+            notice = command_tool.runtime_notice
+            runtime = tuple(i for i in runtime if i.content != notice) + (
+                RuntimeInstruction(RuntimeInstructionKind.RUNTIME_NOTICE, notice),
+            )
         checkpoint = (
             run.context_manager.checkpoint_instructions
             if include_checkpoint

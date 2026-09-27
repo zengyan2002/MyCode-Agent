@@ -119,3 +119,16 @@ hooks:
         Content-Type: application/json
       body: '{"event":"$EVENT","tool":"$TOOL_NAME","file":"$FILE_PATH"}'
     async: true
+
+# 可选：只隔离内置 execute_command。先按 README 构建镜像，再改成 docker。
+# 每次使用过滤后的临时副本；断网；修改不回写宿主；不跨调用保留文件。
+sandbox:
+  backend: local
+  image: mycode-shell-sandbox:v1
+  cpus: 1.0
+  memory_mb: 1024
+  pids_limit: 128
+  workspace_mb: 256
+  snapshot_max_mb: 128
+  snapshot_max_files: 10000
+  exclude: [] # 追加工作区相对 glob，例如 ["datasets/**", "*.bin"]

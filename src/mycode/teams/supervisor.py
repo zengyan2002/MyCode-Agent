@@ -58,6 +58,7 @@ class TeammateSupervisor:
         detector: BackendDetector,
         adapters: Mapping[TeammateBackend, TeammateBackendAdapter],
         session_creator: MemberSessionCreator,
+        launch_environment: Mapping[str, str] | None = None,
     ) -> None:
         """保存创建和控制成员所需的生产组件。
 
@@ -81,6 +82,8 @@ class TeammateSupervisor:
         self.detector = detector
         self.adapters = dict(adapters)
         self.session_creator = session_creator
+        # 父进程冻结的非敏感沙箱配置，首次启动和恢复成员都传递。
+        self.launch_environment = dict(launch_environment or {})
         self._handles: dict[tuple[str, str], BackendHandle] = {}
         self._assignments = {}
 
@@ -152,6 +155,7 @@ class TeammateSupervisor:
             generation=1,
             lease_token=lease,
             prompt=request.prompt,
+            environment=self.launch_environment,
         )
         try:
             handle = await adapter.start(launch)
@@ -449,6 +453,7 @@ class TeammateSupervisor:
                 member.team_id,
                 member.agent_id,
             ),
+            environment=self.launch_environment,
         )
         try:
             handle = await adapter.start(launch)

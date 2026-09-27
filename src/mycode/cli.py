@@ -75,6 +75,9 @@ from mycode.tools import (
 )
 from mycode.tools.interceptors import PlanOnlyInterceptor
 from mycode.tools.scheduler import ToolScheduler
+from mycode.tools.sandbox.docker import (
+    DockerCommandRunner, DockerError, PROFILE_ENV, RUNTIME_NOTICE, export_profile, inherit_profile,
+)
 from mycode.worktrees.binding import shared_workspace_binding
 from mycode.worktrees.cleanup import WorktreeCleanupService
 from mycode.worktrees.git import GitWorktreeBackend
@@ -204,9 +207,14 @@ async def _run_team_host(startup_args: argparse.Namespace) -> int:
         return 1
 
     try:
-        config = load_startup_config()
+        config = inherit_profile(load_startup_config(), dict(os.environ))
         permission_settings = load_permission_settings(workspace_root)
-    except ConfigError as exc:
+        command_sandbox = None
+        if config.sandbox.backend == "docker":
+            command_sandbox = DockerCommandRunner(config.sandbox, workspace_root,
+                config.loaded_config_paths, config.secrets)
+            await command_sandbox.initialize()
+    except (ConfigError, DockerError, OSError, ValueError) as exc:
         Console(stderr=True).print(
             f"[错误] {redact_secrets(str(exc))}",
             style="bold red",
@@ -225,7 +233,7 @@ async def _run_team_host(startup_args: argparse.Namespace) -> int:
             secrets=config.secrets,
             command_completer=CommandCompleter(command_registry),
         )
-        registry = create_tool_registry()
+        registry = create_tool_registry(command_sandbox=command_sandbox)
         registry.register(LoadSkillTool(), source=ToolSource.SYSTEM)
         team_tasks = TeamTaskBoard(team_store)
         team_mailbox = TeamMailbox(team_store)
@@ -373,7 +381,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         # 启动阶段先加载并校验配置，失败时不创建网络客户端。
         config = load_startup_config()
         permission_settings = load_permission_settings(workspace_root)
-    except ConfigError as exc:
+        command_sandbox = None
+        if config.sandbox.backend == "docker":
+            command_sandbox = DockerCommandRunner(config.sandbox, workspace_root,
+                config.loaded_config_paths, config.secrets)
+            asyncio.run(command_sandbox.initialize())
+    except (ConfigError, DockerError, OSError, ValueError) as exc:
         # 配置错误属于可预期的启动失败，统一返回状态码 2。
         Console(stderr=True).print(
             f"[错误] {redact_secrets(str(exc))}",
@@ -404,7 +417,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     # 注册顺序会原样暴露给模型，因此内置注册表负责提供稳定的工具列表。
-    registry = create_tool_registry()
+    registry = create_tool_registry(command_sandbox=command_sandbox)
     # LoadSkill 是 Agent 运行基础设施。主会话和 fork 共用工具定义，但由
     # 各自 ToolContext 选择实际修改哪个 Skill Runtime。
     skill_load_router = SkillLoadRouter()
@@ -715,6 +728,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             TeammateBackend.IN_PROCESS: in_process_backend,
         },
         session_creator=create_member_session,
+        launch_environment={PROFILE_ENV: export_profile(config)},
     )
 
     async def wake_team_member(
@@ -847,6 +861,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"项目指令警告：{warning.path}：{warning.reason}"
         for warning in loaded_instructions.warnings
     ]
+    startup_notices.append(
+        RUNTIME_NOTICE if command_sandbox is not None else "内置 Shell 执行方式：宿主机（未启用 Docker 沙箱）。"
+    )
     if cleaned_sessions:
         startup_notices.append(
             f"已清理 {cleaned_sessions} 个超过 30 天未活动的会话"
