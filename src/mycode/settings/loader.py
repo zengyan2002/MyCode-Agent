@@ -22,6 +22,7 @@ from mycode.hooks.config import parse_hook_layers
 from mycode.models.config import (
     AgentSettings,
     AppConfig,
+    CommandSandboxSettings,
     ExpandedConfigValue,
     HttpMcpServerConfig,
     McpServerConfig,
@@ -55,6 +56,7 @@ _TOP_LEVEL_FIELDS = {
     "hooks",
     "agents",
     "worktrees",
+    "sandbox",
 }
 # Provider 配置允许出现的字段。
 _PROVIDER_FIELDS = {
@@ -1104,6 +1106,32 @@ def _merge_worktree_settings(
         raise ConfigError(f"配置项 worktrees 无效：{exc}") from exc
 
 
+def _sandbox_values(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """解析一层沙箱配置；最终合并后检查额度之间的关系。"""
+    value = raw.get("sandbox", {})
+    if not isinstance(value, dict):
+        raise ConfigError("sandbox 必须是映射")
+    unknown = set(value) - set(CommandSandboxSettings.__dataclass_fields__)
+    if unknown:
+        raise ConfigError("sandbox 包含未知字段")
+    result = dict(value)
+    if "exclude" in result:
+        if not isinstance(result["exclude"], list):
+            raise ConfigError("sandbox.exclude 必须是列表")
+        result["exclude"] = tuple(result["exclude"])
+    return result
+
+
+def _sandbox_settings(*layers: Mapping[str, Any]) -> CommandSandboxSettings:
+    values: dict[str, Any] = {}
+    for layer in layers:
+        values.update(_sandbox_values(layer))
+    try:
+        return CommandSandboxSettings(**values)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"sandbox 配置无效：{exc}") from exc
+
+
 def _build_app_config(
     *,
     active: str | None,
@@ -1112,6 +1140,8 @@ def _build_app_config(
     hooks: tuple[HookDefinition, ...] = (),
     agents: AgentSettings | None = None,
     worktrees: WorktreeSettings | None = None,
+    sandbox: CommandSandboxSettings | None = None,
+    loaded_config_paths: tuple[Path, ...] = (),
 ) -> AppConfig:
     """校验合并结果并构造最终应用配置。
 
@@ -1140,6 +1170,8 @@ def _build_app_config(
         hooks=hooks,
         agents=agents or AgentSettings(),
         worktrees=worktrees or WorktreeSettings(),
+        sandbox=sandbox or CommandSandboxSettings(),
+        loaded_config_paths=loaded_config_paths,
     )
 
 
@@ -1193,6 +1225,8 @@ def load_config(
         hooks=hooks,
         agents=agents,
         worktrees=worktrees,
+        sandbox=_sandbox_settings(raw),
+        loaded_config_paths=(config_path.resolve(),),
     )
 
 
@@ -1327,4 +1361,8 @@ def load_startup_config(
         hooks=hooks,
         agents=_merge_agent_settings(user_agents, project_agents),
         worktrees=_merge_worktree_settings(user_worktrees, project_worktrees),
+        sandbox=_sandbox_settings(user_raw, project_raw),
+        loaded_config_paths=tuple(dict.fromkeys(
+            p for p in (user_path, project_path, local_path) if p.exists()
+        )),
     )

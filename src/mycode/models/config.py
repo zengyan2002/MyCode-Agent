@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from mycode.constants import (
     DEFAULT_COMPACTION_OUTPUT_TOKENS,
@@ -375,6 +376,42 @@ class WorktreeSettings:
 
 
 @dataclass(frozen=True)
+class CommandSandboxSettings:
+    """决定内置 Shell 在宿主还是临时 Docker 副本中执行。"""
+
+    backend: str = "local"
+    image: str = "mycode-shell-sandbox:v1"
+    cpus: float = 1.0
+    memory_mb: int = 1024
+    pids_limit: int = 128
+    workspace_mb: int = 256
+    snapshot_max_mb: int = 128
+    snapshot_max_files: int = 10000
+    exclude: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.backend not in ("local", "docker"):
+            raise ValueError("sandbox.backend 只能是 local 或 docker")
+        if not isinstance(self.image, str) or not self.image.strip() or self.image.startswith("-"):
+            raise ValueError("sandbox.image 必须是镜像名称")
+        if (isinstance(self.cpus, bool) or not isinstance(self.cpus, (int, float))
+                or not math.isfinite(self.cpus) or self.cpus <= 0):
+            raise ValueError("sandbox.cpus 必须是正数")
+        for name in ("memory_mb", "pids_limit", "workspace_mb", "snapshot_max_mb", "snapshot_max_files"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"sandbox.{name} 必须是正整数")
+        if self.snapshot_max_mb > self.workspace_mb:
+            raise ValueError("sandbox.snapshot_max_mb 不能超过 workspace_mb")
+        if not isinstance(self.exclude, tuple):
+            raise ValueError("sandbox.exclude 必须是路径模式列表")
+        for pattern in self.exclude:
+            if (not isinstance(pattern, str) or not pattern or "\\" in pattern
+                    or ":" in pattern or pattern.startswith("/") or ".." in pattern.split("/")):
+                raise ValueError("sandbox.exclude 只允许使用 / 分隔的工作区相对模式")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """包含全部 Provider 与 MCP Server 的应用配置。"""
 
@@ -390,6 +427,9 @@ class AppConfig:
     agents: AgentSettings = field(default_factory=AgentSettings)
     # Worktree 创建初始化、会话恢复和后台过期清理使用的配置。
     worktrees: WorktreeSettings = field(default_factory=WorktreeSettings)
+    sandbox: CommandSandboxSettings = field(default_factory=CommandSandboxSettings)
+    # 用于沙箱排除实际读取的配置文件，避免复制非标准位置的密钥配置。
+    loaded_config_paths: tuple[Path, ...] = ()
 
     @property
     def active_provider(self) -> ProviderConfig:
