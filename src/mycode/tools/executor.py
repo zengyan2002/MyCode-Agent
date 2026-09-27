@@ -13,6 +13,7 @@ from mycode.persistence.operations import OperationError, OperationStore, operat
 from mycode.tools.base import ToolContext, ToolFailure, ToolOutput
 from mycode.tools.registry import ToolRegistry
 from mycode.tools.builtin.files import ReadFileTool, WriteFileTool, EditFileTool
+from mycode.tools.builtin.command import ExecuteCommandTool
 from mycode.tools.builtin.paths import WorkspacePaths
 from mycode.tools.file_journal import FileWriteJournal
 from mycode.models.tools import ToolSource
@@ -120,6 +121,8 @@ class ToolExecutor:
         context = self._context
         candidates = ()
         builtin = self._registry.source_for(call.name) is ToolSource.BUILTIN
+        if builtin and isinstance(tool, ExecuteCommandTool):
+            context = replace(context, operation_record=record)
         if builtin and isinstance(tool, (WriteFileTool, EditFileTool)):
             context = replace(context, file_write_journal=FileWriteJournal(
                 self.store, operation_id, owner_token, record.attempt))

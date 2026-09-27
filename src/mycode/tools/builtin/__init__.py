@@ -8,9 +8,10 @@ from mycode.tools.builtin.search import FindFilesTool, SearchCodeTool
 from mycode.tools.builtin.tool_search import ToolSearchTool
 from mycode.models.tools import ToolSource
 from mycode.tools.registry import ToolRegistry
+from mycode.tools.sandbox.docker import DockerCommandRunner
 
 
-def create_builtin_registry() -> ToolRegistry:
+def create_builtin_registry(*, command_sandbox: DockerCommandRunner | None = None) -> ToolRegistry:
     """
     返回参数的类型：ToolRegistry
     registry._tools  工具
@@ -23,7 +24,7 @@ def create_builtin_registry() -> ToolRegistry:
         ReadFileTool(),
         WriteFileTool(),
         EditFileTool(),
-        ExecuteCommandTool(),
+        ExecuteCommandTool(command_sandbox),
         FindFilesTool(),
         SearchCodeTool(),
     ):

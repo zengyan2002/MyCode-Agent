@@ -14,6 +14,7 @@ from mycode.tools.file_cache import AgentFileCache
 from mycode.worktrees.binding import WorkspaceBinding, shared_workspace_binding
 
 if TYPE_CHECKING:
+    from mycode.models.operations import OperationRecord
     from mycode.tools.file_journal import FileWriteJournal
     from mycode.models.teams import TeamActorContext
     from mycode.skills.resources import SkillResourceAccess
@@ -60,6 +61,8 @@ class ToolContext:
     file_write_journal: FileWriteJournal | None = None
     # 自动核查必须读取磁盘，不能使用先前读取留下的文件正文缓存。
     fresh_file_read: bool = False
+    # Executor 为当前内置命令提供领取记录，用于关联容器与稳定操作 ID。
+    operation_record: OperationRecord | None = None
 
     def __post_init__(self) -> None:
         """校验工具上下文，并把旧的绝对路径参数转换成共享绑定。

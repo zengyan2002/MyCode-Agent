@@ -7,6 +7,7 @@ import os
 import subprocess
 import threading
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import BinaryIO
 
@@ -14,6 +15,7 @@ from mycode.models.json_types import JsonValue
 from mycode.models.tools import ToolAccess, ToolDefinition, ToolErrorCode
 from mycode.tools.base import ToolContext, ToolOutput
 from mycode.tools.processes import terminate_process_tree
+from mycode.tools.sandbox.docker import DockerCommandRunner, RUNTIME_NOTICE
 
 
 _EXECUTE_COMMAND = ToolDefinition(
@@ -194,9 +196,17 @@ def _command_content(stdout: bytes, stderr: bytes) -> str:
 class ExecuteCommandTool:
     """在工作区执行非交互 Shell 命令并返回完整文本输出。"""
 
+    def __init__(self, sandbox: DockerCommandRunner | None = None) -> None:
+        self.sandbox = sandbox
+
+    @property
+    def runtime_notice(self) -> str | None:
+        return RUNTIME_NOTICE if self.sandbox is not None else None
+
     @property
     def definition(self) -> ToolDefinition:
-        return _EXECUTE_COMMAND
+        return (replace(_EXECUTE_COMMAND, description=RUNTIME_NOTICE)
+                if self.sandbox is not None else _EXECUTE_COMMAND)
 
     #接收模型提供的Shell命令，在工作区中启动命令，异步等待执行、收集受限的stdout和stderr，处理用户取消，最后返回结构化工具结果。
     async def execute(
@@ -221,6 +231,8 @@ class ExecuteCommandTool:
 
         #拿到模型传来的命令
         command = str(arguments["command"])
+        if self.sandbox is not None:
+            return await self.sandbox.run(command, context)
 
         #创建命令启动任务
         start_shell_task = asyncio.create_task(
