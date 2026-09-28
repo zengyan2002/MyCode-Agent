@@ -159,13 +159,15 @@ python -m pip install -e ".[dev]"
 ```powershell
 # PowerShell
 Copy-Item .env.example .env
-Copy-Item config.example.yaml config.local.yaml
+New-Item -ItemType Directory -Force .mycode | Out-Null
+Copy-Item config.example.yaml .mycode/config.yaml
 ```
 
 ```bash
 # bash / zsh
 cp .env.example .env
-cp config.example.yaml config.local.yaml
+mkdir -p .mycode
+cp config.example.yaml .mycode/config.yaml
 ```
 
 最小 OpenAI 兼容配置：
@@ -241,7 +243,7 @@ Agent、模型连接和 SQLite 留在宿主，只把内置 `execute_command` 放
 docker build -t mycode-shell-sandbox:v1 sandbox/docker
 ```
 
-然后在项目的 `config.yaml` 添加：
+然后在项目的 `.mycode/config.yaml` 添加（已有 Provider 配置时直接追加到同一个文件；也可以使用 `MYCODE_CONFIG` 指定的项目配置文件）：
 
 ```yaml
 sandbox:
