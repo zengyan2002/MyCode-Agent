@@ -11,7 +11,7 @@ import threading
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from mycode.errors import ConfigError
+from mycode.errors import ConfigError, redact_secrets
 from mycode.models.config import AppConfig, CommandSandboxSettings, SecretValue
 from mycode.models.operations import OperationState
 from mycode.models.tools import ToolErrorCode
@@ -262,9 +262,11 @@ class DockerCommandRunner:
                 pass
             remove_record(self.control_root, record)
             raise
-        except (OSError, SnapshotError):
+        except (OSError, SnapshotError) as exc:
             remove_record(self.control_root, record)
-            return ToolOutput.fail(ToolErrorCode.BLOCKED, "工作副本准备失败或超限，命令未启动")
+            reason = redact_secrets(str(exc), self.secrets)
+            return ToolOutput.fail(ToolErrorCode.BLOCKED,
+                f"工作副本准备失败，命令未启动：{reason}")
         # --mount 的 CSV 语法不能直接表示逗号路径，拒绝而不是误挂载。
         if "," in str(input_path):
             remove_record(self.control_root, record)
