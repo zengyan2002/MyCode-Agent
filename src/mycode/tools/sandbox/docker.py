@@ -122,9 +122,11 @@ class DockerCommandRunner:
         address = self.endpoint if endpoint is None else endpoint
         if address:
             prefix += ["--host", address]
+        # Docker Desktop 休眠时，create 会先唤醒引擎；实测唤醒超过 5 秒。
+        timeout = 20 if args[0] == "create" else 5
         task = asyncio.create_task(asyncio.to_thread(subprocess.run,
             [*prefix, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=5, check=False,
+            stderr=subprocess.PIPE, timeout=timeout, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)))
         try:
             result = await asyncio.shield(task)
@@ -134,8 +136,10 @@ class DockerCommandRunner:
             except (OSError, subprocess.SubprocessError):
                 pass
             raise
+        except subprocess.TimeoutExpired as exc:
+            raise DockerError(f"Docker {args[0]} 请求超过 {timeout} 秒，未取得结果") from exc
         except (OSError, subprocess.SubprocessError) as exc:
-            raise DockerError("Docker 管理请求未能完成") from exc
+            raise DockerError(f"Docker {args[0]} 管理请求未能完成") from exc
         if result.returncode:
             raise DockerError(f"Docker {args[0]} 请求失败")
         return result.stdout.decode("utf-8")
@@ -297,8 +301,10 @@ class DockerCommandRunner:
             save_record(self.control_root, record)
         except asyncio.CancelledError:
             cancelled = True
-        except (DockerError, OSError, ValueError, KeyError):
-            error = "Docker 执行状态未能确认"
+        except DockerError as exc:
+            error = str(exc)
+        except (OSError, ValueError, KeyError) as exc:
+            error = f"Docker 执行状态未能确认：{type(exc).__name__}"
         finally:
             if start_task is not None and process is None:
                 try:
@@ -309,7 +315,7 @@ class DockerCommandRunner:
             try:
                 await _settle(cleanup_task)
             except (DockerError, OSError, ValueError):
-                error = "Docker 容器清理未能确认，请检查沙箱追踪记录"
+                error = (f"{error}；" if error else "") + "Docker 容器清理未能确认，请检查沙箱追踪记录"
             if process is not None:
                 terminate_task = asyncio.create_task(asyncio.to_thread(terminate_process_tree, process))
                 if await _settle(terminate_task):

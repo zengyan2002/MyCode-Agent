@@ -179,8 +179,8 @@ class ToolExecutor:
             if uncertain:
                 await operation_io(self.store.mark_unknown, operation_id, owner_token,
                                    result.error_message or "工具效果无法确认", result)
-                return operation_failure(call, ToolErrorCode.OPERATION_UNKNOWN,
-                    f"工具可能已经生效，结果无法确认。操作：{operation_id}。{result.error_message}")
+                return replace(result, error_code=ToolErrorCode.OPERATION_UNKNOWN,
+                    error_message=f"工具可能已经生效，结果无法确认。操作：{operation_id}。{result.error_message}")
             if verifying_read and not cancelled:
                 return await operation_io(self.store.complete_verification_read,
                                           operation_id, owner_token, result, candidates)

@@ -54,6 +54,7 @@ _ERROR_LABELS = {
     ToolErrorCode.IO_ERROR: "读写失败",
     ToolErrorCode.TIMEOUT: "执行超时",
     ToolErrorCode.BLOCKED: "执行受阻",
+    ToolErrorCode.OPERATION_UNKNOWN: "结果未知",
     ToolErrorCode.CANCELLED: "已取消",
     ToolErrorCode.INTERNAL_ERROR: "内部错误",
 }
