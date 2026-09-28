@@ -14,7 +14,8 @@ from mycode.models.config import CommandSandboxSettings, SecretValue
 
 
 _EXCLUDED = frozenset({".git", ".mycode", ".env", "config.local.yaml", ".ssh", ".aws",
-    ".azure", ".docker", ".kube", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"})
+    ".azure", ".docker", ".kube", ".venv", "venv", "node_modules", "__pycache__",
+    ".pytest_cache", "build", "dist"})
 _CHUNK = 65536
 
 

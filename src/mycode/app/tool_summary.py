@@ -53,7 +53,7 @@ _ERROR_LABELS = {
     ToolErrorCode.COMMAND_FAILED: "命令失败",
     ToolErrorCode.IO_ERROR: "读写失败",
     ToolErrorCode.TIMEOUT: "执行超时",
-    ToolErrorCode.BLOCKED: "权限拒绝",
+    ToolErrorCode.BLOCKED: "执行受阻",
     ToolErrorCode.CANCELLED: "已取消",
     ToolErrorCode.INTERNAL_ERROR: "内部错误",
 }
