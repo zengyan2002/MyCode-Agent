@@ -361,7 +361,7 @@ class TeamService:
         """关闭随主程序事件循环运行的成员，不删除团队或成员会话。
 
         Returns:
-            所有 in-process Host 已暂停后返回。独立终端后端保持运行。
+            所有 subprocess Host 已暂停后返回。独立终端后端保持运行。
         """
 
         await self.supervisor.close_local_hosts()

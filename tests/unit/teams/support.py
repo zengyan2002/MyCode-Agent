@@ -66,7 +66,7 @@ def add_member(
             worktree_name=f"team-{agent_id}",
             worktree_path=worktree,
             branch=f"codex/team-{agent_id}",
-            backend=TeammateBackend.IN_PROCESS,
+            backend=TeammateBackend.SUBPROCESS,
             backend_ref=None,
             state=TeammateState.IDLE,
             runtime_generation=1,

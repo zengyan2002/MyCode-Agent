@@ -60,8 +60,7 @@ class TeammateHost:
         Args:
             launch: Supervisor 生成的 team/member/generation、租约和工作区。
             wait_for_wake: 在成员空闲时等待一次唤醒的异步函数。
-                同进程后端传入消费并清除 Event 的函数，独立窗格
-                Host 传入等待标准输入的函数。
+                独立进程 Host 传入等待标准输入的函数。
 
         Returns:
             收到 shutdown_request 或 task 被取消后结束，不删除会话和成员。

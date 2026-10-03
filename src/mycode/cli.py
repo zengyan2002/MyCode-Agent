@@ -87,9 +87,9 @@ from mycode.worktrees.state import WorktreeStateStore
 from mycode.agents.workspaces import AgentWorkspaceService
 from mycode.teams.backends.detection import BackendDetector
 from mycode.teams.backends.base import TeammateLaunch
-from mycode.teams.backends.in_process import InProcessBackend
 from mycode.teams.backends.iterm2 import ITerm2Backend
 from mycode.teams.backends.tmux import TmuxBackend
+from mycode.teams.backends.subprocess import SubprocessBackend
 from mycode.teams.host import TeammateHost
 from mycode.teams.integration import TeamIntegrationService
 from mycode.teams.mailbox import TeamMailbox
@@ -207,7 +207,7 @@ async def _run_team_host(startup_args: argparse.Namespace) -> int:
         return 1
 
     try:
-        config = inherit_profile(load_startup_config(), dict(os.environ))
+        config = inherit_profile(load_startup_config(working_directory=workspace_root), dict(os.environ))
         permission_settings = load_permission_settings(workspace_root)
         command_sandbox = None
         if config.sandbox.backend == "docker":
@@ -647,39 +647,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     agent_catalog = AgentCatalog(AgentCatalogSnapshot({}, {}, ()))
     team_tasks = TeamTaskBoard(team_store)
     team_mailbox = TeamMailbox(team_store)
-    team_workspace_service = TeamAgentWorkspaceService(worktree_manager)
-    team_runtime_builder = IndependentAgentRuntimeBuilder(
-        request_runner,
-        registry,
-        hook_engine,
-        provider_config,
-        workspace_root,
-        permission_settings,
-        permission_controller,
-        permission_store,
-        ui,
-        skill_catalog,
-        team_workspace_service,
-        user_memory_root=memory_store.user_memory_root,
-        secrets=config.secrets,
-    )
-    team_runtime_factory = TeamMemberRuntimeFactory(
-        store=team_store,
-        mailbox=team_mailbox,
-        catalog=agent_catalog,
-        runtime_builder=team_runtime_builder,
-        request_runner=request_runner,
-        provider_config=provider_config,
-        stable_prompt=stable_prompt,
-        parent_permissions=permission_controller,
-    )
-    teammate_host = TeammateHost(
-        team_store,
-        team_mailbox,
-        team_runtime_factory,
-    )
-    in_process_backend = InProcessBackend(teammate_host)
-
     def create_member_session(team_id: str) -> str:
         """在团队自己的 sessions 目录创建一个空成员会话。
 
@@ -723,9 +690,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         worktrees=worktree_manager,
         detector=BackendDetector(),
         adapters={
+            TeammateBackend.SUBPROCESS: SubprocessBackend(),
             TeammateBackend.TMUX: TmuxBackend(),
             TeammateBackend.ITERM2: ITerm2Backend(),
-            TeammateBackend.IN_PROCESS: in_process_backend,
         },
         session_creator=create_member_session,
         launch_environment={PROFILE_ENV: export_profile(config)},

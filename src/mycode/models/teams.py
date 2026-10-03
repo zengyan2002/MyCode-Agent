@@ -36,7 +36,7 @@ class BackendPreference(str, Enum):
     AUTO = "auto"
     TMUX = "tmux"
     ITERM2 = "iterm2"
-    IN_PROCESS = "in-process"
+    SUBPROCESS = "subprocess"
 
 
 class TeammateBackend(str, Enum):
@@ -44,7 +44,7 @@ class TeammateBackend(str, Enum):
 
     TMUX = "tmux"
     ITERM2 = "iterm2"
-    IN_PROCESS = "in-process"
+    SUBPROCESS = "subprocess"
 
 
 class TeamTaskStatus(str, Enum):
@@ -177,10 +177,10 @@ class TeammateRecord:
         worktree_path: 成员工具实际使用的绝对工作目录。
         branch: 成员提交代码的 Git 分支。
         backend: 成员实际使用的后端。
-        backend_ref: pane、session 或同进程 task 的运行标识。
+        backend_ref: pane、session 或子进程 的运行标识。
         state: 成员当前生命周期状态。
         runtime_generation: 每次 Host 启动时递增的写入栅栏。
-        owner_pid: 外部 Host 进程；同进程成员可以为空。
+        owner_pid: 外部 Host 进程 ID；终端后端无法取得时可以为空。
         lease_token_hash: 当前租约摘要，原文不写磁盘。
         plan_mode_required: 修改工作区前是否必须取得 Lead 批准。
         current_task_id: 当前 working 任务；没有时为空。

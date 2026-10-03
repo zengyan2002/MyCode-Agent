@@ -270,6 +270,16 @@ $env:MYCODE_RUN_DOCKER_TESTS = '1'
 python -m pytest -q tests/integration/test_docker_command_sandbox.py
 ```
 
+## Windows 多进程团队成员
+
+团队成员支持 `backend="subprocess"`：使用当前 Python 解释器启动独立成员进程，无需 tmux 或 WSL，也不会弹出终端窗口。该参数属于创建团队成员的 Agent 工具参数，不是全局 YAML 配置项。
+
+所有平台使用 `backend="auto"`，在没有可用的 tmux/iTerm2 时都会选择 `subprocess`；显式指定 `tmux` 仍要求安装对应程序。已移除 `in-process`，旧成员记录在读取时自动映射到 `subprocess`，恢复团队时重新启动。
+
+成员在自己的 worktree 中执行工具，从主工作区读取项目配置和 `.env`，通过持久化邮箱收发任务、标准输入管道接收唤醒。主程序正常退出时会关闭它持有的 subprocess 成员并保存为 suspended；恢复团队时重新启动成员并加载已有会话。这些进程不提供可交互终端，标准输出和标准错误不会显示在主界面，启动失败通过成员状态或退出码报告。
+
+团队状态、任务板和邮箱使用操作系统文件锁（Windows 为 `msvcrt`，POSIX 为 `flock`），进程退出后自动释放。锁文件会保留，文件存在不代表正在占用。升级后需重启所有旧版主程序和成员，避免混用两种锁协议。会话历史继续使用现有文件锁。
+
 ## 项目结构
 
 ```text

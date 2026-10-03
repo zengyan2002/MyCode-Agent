@@ -119,7 +119,7 @@ class ChatApplication:
             worktree_manager: 子 Agent 隔离、会话目录绑定和恢复使用的 Manager。
             worktree_cleanup: 启动扫描和周期清理过期临时目录的后台服务。
             team_service: 可选的长期团队生命周期服务；应用启动时恢复 Lead，
-                关闭时只暂停同进程成员，不删除团队数据。
+                关闭时暂停本程序启动的 subprocess 成员，不删除团队数据。
             resume_session_id: CLI ``--resume`` 指定的旧会话 ID；未提供时保留
                 启动阶段创建的新会话。
 
@@ -885,7 +885,7 @@ class ChatApplication:
                 try:
                     await self._team_service.close_local_hosts()
                 except Exception:
-                    self._ui.show_error("暂停同进程团队成员时发生错误")
+                    self._ui.show_error("暂停子进程团队成员时发生错误")
                     exit_code = 1
             if self._worktree_manager is not None:
                 try:

@@ -313,7 +313,7 @@ class TeammateSupervisor:
         return tuple(reports)
 
     async def close_local_hosts(self) -> None:
-        """关闭当前进程持有的 in-process Host，并保留全部团队磁盘状态。
+        """关闭当前进程持有的 subprocess Host，并保留全部团队磁盘状态。
 
         Returns:
             所有本地 Host 已取消并标为 ``suspended`` 后返回。tmux 和 iTerm2
@@ -321,7 +321,7 @@ class TeammateSupervisor:
         """
 
         for (team_id, member_id), handle in tuple(self._handles.items()):
-            if handle.backend is not TeammateBackend.IN_PROCESS:
+            if handle.backend is not TeammateBackend.SUBPROCESS:
                 continue
             await self.adapters[handle.backend].stop(handle, force=False)
             self._handles.pop((team_id, member_id), None)

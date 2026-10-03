@@ -339,7 +339,7 @@ class AgentToolRequest:
                 raise ValueError("创建团队成员必须填写 name 和 subagent_type")
             if self.run_in_background is not None:
                 raise ValueError("团队成员是长期运行实例，不能填写 run_in_background")
-            if self.backend not in {None, "auto", "tmux", "iterm2", "in-process"}:
+            if self.backend not in {None, "auto", "tmux", "iterm2", "subprocess"}:
                 raise ValueError("团队成员 backend 取值无效")
 
 

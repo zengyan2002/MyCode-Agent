@@ -209,7 +209,8 @@ def _member_from_json(raw: dict[str, Any]) -> TeammateRecord:
         worktree_name=str(raw["worktree_name"]),
         worktree_path=Path(str(raw["worktree_path"])),
         branch=str(raw["branch"]),
-        backend=TeammateBackend(str(raw["backend"])),
+        backend=(TeammateBackend.SUBPROCESS if raw["backend"] == "in-process"
+                 else TeammateBackend(str(raw["backend"]))),
         backend_ref=raw.get("backend_ref"),
         state=TeammateState(str(raw["state"])),
         runtime_generation=int(raw["runtime_generation"]),

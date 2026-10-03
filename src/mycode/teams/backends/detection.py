@@ -1,10 +1,9 @@
-"""在创建成员前一次性选择 tmux、iTerm2 或同进程后端。"""
+"""在创建成员前一次性选择终端或独立子进程后端。"""
 
 from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 from collections.abc import Mapping
 
 from mycode.models.teams import BackendPreference, TeammateBackend
@@ -54,15 +53,15 @@ class BackendDetector:
             if not self._iterm_available():
                 raise BackendDetectionError("显式指定 iTerm2，但当前不在 iTerm2 或找不到 it2")
             return TeammateBackend.ITERM2
-        if preference is BackendPreference.IN_PROCESS:
-            return TeammateBackend.IN_PROCESS
+        if preference is BackendPreference.SUBPROCESS:
+            return TeammateBackend.SUBPROCESS
         if self._inside_tmux():
             return TeammateBackend.TMUX
         if self._iterm_available():
             return TeammateBackend.ITERM2
         if self._tmux_available():
             return TeammateBackend.TMUX
-        return TeammateBackend.IN_PROCESS
+        return TeammateBackend.SUBPROCESS
 
     def _inside_tmux(self) -> bool:
         """判断当前进程确实位于 tmux 且可执行程序仍可用。

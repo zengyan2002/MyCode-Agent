@@ -43,7 +43,7 @@ _AGENT_TOOL = ToolDefinition(
             },
             "backend": {
                 "type": "string",
-                "enum": ["auto", "tmux", "iterm2", "in-process"],
+                "enum": ["auto", "tmux", "iterm2", "subprocess"],
             },
             "plan_mode_required": {"type": "boolean"},
         },

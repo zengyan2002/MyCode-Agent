@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from mycode.models.teams import TeammateBackend, TeammateState
-from mycode.teams.backends.in_process import InProcessBackend
+from mycode.teams.backends.base import BackendHandle, BackendProbe
 from mycode.teams.mailbox import TeamMailbox
 from mycode.teams.message_tool import SendMessageTool
 from mycode.teams.supervisor import TeammateSupervisor
@@ -22,8 +22,33 @@ from tests.unit.teams.support import add_member
 from tests.unit.teams.test_host import make_host, next_turn
 
 
+class ControlledHostBackend:
+    """仅供通信测试控制轮次的 adapter，不属于生产后端。"""
+
+    def __init__(self, host):
+        self.host = host
+        self.event = asyncio.Event()
+
+    async def start(self, launch):
+        async def wait():
+            await self.event.wait()
+            self.event.clear()
+        self.task = asyncio.create_task(self.host(launch, wait))
+        return BackendHandle(TeammateBackend.SUBPROCESS, "controlled")
+
+    async def wake(self, handle):
+        self.event.set()
+
+    async def stop(self, handle, *, force):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+
+    async def probe(self, handle):
+        return BackendProbe(not self.task.done())
+
+
 async def start_member(env, tmp_path):
-    """使用真实同进程后端，同时观察 Host 的等待和退出。"""
+    """直接调度 Host，隔离模型轮次；生产后端另用真实子进程测试。"""
     waiting = asyncio.Queue()
     finished = asyncio.Event()
 
@@ -37,7 +62,7 @@ async def start_member(env, tmp_path):
         finally:
             finished.set()
 
-    backend = InProcessBackend(run_host)
+    backend = ControlledHostBackend(run_host)
     handle = await backend.start(env.launch)
     env.store.update_member(env.lead, env.member.actor_id, lambda member: replace(
         member, backend_ref=handle.reference,
@@ -45,7 +70,7 @@ async def start_member(env, tmp_path):
     supervisor = TeammateSupervisor(
         workspace_root=tmp_path, store=env.store, tasks=TeamTaskBoard(env.store),
         worktrees=MagicMock(), detector=MagicMock(),
-        adapters={TeammateBackend.IN_PROCESS: backend}, session_creator=MagicMock(),
+        adapters={TeammateBackend.SUBPROCESS: backend}, session_creator=MagicMock(),
     )
     return backend, handle, supervisor, waiting, finished
 

@@ -1,4 +1,4 @@
-"""三种成员后端共同使用的启动参数和运行接口。"""
+"""成员后端共同使用的启动参数和运行接口。"""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class BackendHandle:
 
     Attributes:
         backend: 实际创建该句柄的后端。
-        reference: pane、session 或同进程 task 的稳定引用文字。
+        reference: pane、session 或子进程 的稳定引用文字。
         process_id: 外部 Host 的进程 ID；无法取得时为空。
     """
 
@@ -64,10 +64,10 @@ class BackendProbe:
 
 
 class TeammateBackendAdapter(Protocol):
-    """由三个真实生产后端实现的成员进程控制接口。
+    """由各生产后端实现的成员进程控制接口。
 
     Attributes:
-        backend: 当前实现负责的 tmux、iTerm2 或 in-process 后端类型。
+        backend: 当前实现负责的 tmux、iTerm2、subprocess 后端类型。
     """
 
     backend: TeammateBackend
@@ -116,4 +116,3 @@ class TeammateBackendAdapter(Protocol):
 
 # 一次返回表示消费一次后端通知；没有新通知时，下一次调用应等待。
 WakeWaiter = Callable[[], Awaitable[None]]
-HostCoroutine = Callable[[TeammateLaunch, WakeWaiter], Awaitable[None]]
