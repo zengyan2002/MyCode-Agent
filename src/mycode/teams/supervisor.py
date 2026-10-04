@@ -216,24 +216,13 @@ class TeammateSupervisor:
         actor: TeamActorContext,
         task_ids: tuple[str, ...],
     ):
-        """唤醒全部空闲成员，并只用成功者创建检查轮次。
-
-        Args:
-            actor: 创建任务的当前 Lead 身份。
-            task_ids: 本次新开放、需要成员查看的任务 ID。
-
-        Returns:
-            ``TeamTaskBoard.open_scan`` 创建的检查轮次。
-        """
-
-        successful: list[str] = []
+        """任务板已持久化认领通知；管道唤醒仅用于让空闲成员立即检查。"""
         for member in self.store.load_team(actor.team_id).members:
             try:
-                if await self.wake(actor.team_id, member.agent_id):
-                    successful.append(member.agent_id)
+                await self.wake(actor.team_id, member.agent_id)
             except Exception:
+                # 成员仍会从磁盘检查通知，正在运行的成员在回合结束后处理。
                 continue
-        return self.tasks.open_scan(actor.team_id, task_ids, tuple(successful))
 
     async def stop(
         self,

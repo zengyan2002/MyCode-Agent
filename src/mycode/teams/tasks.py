@@ -144,6 +144,7 @@ class TeamTaskBoard:
             )
             tasks.append(task)
             self._validate_graph(tasks)
+            self._queue_claim_scan(actor.team_id, tasks, scans, (task.task_id,))
             self._save(actor.team_id, revision + 1, tasks, scans)
             return task
 
@@ -305,9 +306,17 @@ class TeamTaskBoard:
                     raise TeamTaskError("成员不能修改负责人、优先级或依赖")
             else:
                 request = self._normalize_lead_owner(actor, task, request)
+            before = {(item.task_id, item.owner_id) for item in tasks if self._view(item, tasks).claimable}
             updated = self._apply_update(actor, task, request, tasks)
             tasks[index] = updated
             self._validate_graph(tasks)
+            newly_available = tuple(item.task_id for item in tasks
+                                    if self._view(item, tasks).claimable
+                                    and (item.task_id, item.owner_id) not in before)
+            self._queue_claim_scan(actor.team_id, tasks, scans, newly_available)
+            if task.status is TeamTaskStatus.WORKING and updated.status is not TeamTaskStatus.WORKING and task.owner_id:
+                self._queue_claim_scan(actor.team_id, tasks, scans,
+                                       tuple(item.task_id for item in tasks), (task.owner_id,))
             self._save(actor.team_id, revision + 1, tasks, scans)
             if task.status is TeamTaskStatus.WORKING and updated.status is not TeamTaskStatus.WORKING and task.owner_id:
                 self.store.set_member_current_task(actor.team_id, task.owner_id, None, actor="task-board")
@@ -381,6 +390,36 @@ class TeamTaskBoard:
             if not failure_context:
                 raise TeamTaskError("失败任务转交前必须保留失败原因或阶段结果")
         return replace(request, owner=target.agent_id)
+
+    def _queue_claim_scan(
+        self, team_id: str, tasks: list[TeamTaskRecord], scans: list[ClaimScanRound],
+        task_ids: tuple[str, ...], member_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        """在任务写锁内登记通知，随任务一起保存；忙碌成员也保留通知。"""
+        candidates = [task for task in tasks if task.task_id in task_ids and self._view(task, tasks).claimable]
+        if not candidates:
+            return
+        members = tuple(member.agent_id for member in self.store.load_team(team_id).members
+                        if member.state in {TeammateState.STARTING, TeammateState.RUNNING,
+                                            TeammateState.IDLE, TeammateState.SUSPENDED}
+                        and (member_ids is None or member.agent_id in member_ids)
+                        and any(task.owner_id in {None, member.agent_id} for task in candidates))
+        if members:
+            scans.append(ClaimScanRound(
+                round_id=f"scan-{secrets.token_hex(5)}", team_id=team_id,
+                task_ids=tuple(task.task_id for task in candidates),
+                expected_member_ids=members, finished_member_ids=(), claimed_task_ids=(),
+                created_at=_now(),
+            ))
+
+    def pending_scans(self, actor: TeamActorContext) -> tuple[ClaimScanRound, ...]:
+        """读取本成员尚未处理的通知；有 working 任务时留待完成后处理。"""
+        self._require_member(actor)
+        _, tasks, scans = self._load(actor.team_id)
+        if any(task.owner_id == actor.actor_id and task.status is TeamTaskStatus.WORKING for task in tasks):
+            return ()
+        return tuple(scan for scan in scans if actor.actor_id in scan.expected_member_ids
+                     and actor.actor_id not in scan.finished_member_ids)
 
     def open_scan(
         self,

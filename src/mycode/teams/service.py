@@ -150,8 +150,7 @@ class TeamService:
             request: 任务说明、类型、优先级和直接依赖。
 
         Returns:
-            已写入共享任务板的新任务。唤醒失败不会撤销任务；检查轮次只会
-            等待实际唤醒成功的成员。
+            新任务与认领通知已经共同落盘；管道唤醒失败也不会丢失通知。
         """
 
         task = self.tasks.create(actor, request)

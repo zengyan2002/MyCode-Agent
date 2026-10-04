@@ -15,6 +15,7 @@ from mycode.teams.backends.base import TeammateLaunch, WakeWaiter
 from mycode.teams.mailbox import TeamMailbox
 from mycode.teams.runtime import TeamRuntimeLoader
 from mycode.teams.store import TeamStateStore
+from mycode.teams.tasks import TeamTaskBoard
 
 
 _MAILBOX_POLL_SECONDS = 0.2
@@ -49,6 +50,7 @@ class TeammateHost:
         self.store = store
         self.mailbox = mailbox
         self.runtime_loader = runtime_loader
+        self.tasks = TeamTaskBoard(store)
 
     async def __call__(
         self,
@@ -93,11 +95,17 @@ class TeammateHost:
                 ),
                 lease_token=launch.lease_token,
             )
+            # 新建或恢复成员时也检查已有任务，覆盖任务先于成员创建的情况。
+            if not self.tasks.pending_scans(actor):
+                available = tuple(view.task.task_id for view in self.tasks.list(actor) if view.claimable)
+                if available:
+                    self.tasks.open_scan(actor.team_id, available, (actor.actor_id,))
             pending_prompt = launch.prompt.strip()
             first_prompt_pending = bool(pending_prompt)
             while True:
                 messages = self.mailbox.read_unread(actor)
-                if not pending_prompt and not messages:
+                scans = self.tasks.pending_scans(actor)
+                if not pending_prompt and not messages and not scans:
                     self.store.update_member(
                         actor,
                         launch.agent_id,
@@ -121,9 +129,11 @@ class TeammateHost:
                             messages = self.mailbox.read_unread(actor)
                             break
                         messages = self.mailbox.read_unread(actor)
-                        if any(message.wake for message in messages):
+                        scans = self.tasks.pending_scans(actor)
+                        if scans or any(message.wake for message in messages):
                             break
-                    if not messages:
+                    scans = self.tasks.pending_scans(actor)
+                    if not messages and not scans:
                         continue
                 shutdown = any(
                     item.kind is TeamMessageKind.SHUTDOWN_REQUEST for item in messages
@@ -132,6 +142,18 @@ class TeammateHost:
                 parts.extend(
                     f"团队消息[{item.summary}]：{item.body}" for item in messages
                 )
+                if not shutdown:
+                    available = {view.task.task_id for view in self.tasks.list(actor) if view.claimable}
+                    for scan in scans:
+                        candidates = tuple(task_id for task_id in scan.task_ids if task_id in available)
+                        if candidates:
+                            parts.append(
+                                f"任务认领检查：round_id={scan.round_id}，候选任务={', '.join(candidates)}。"
+                                "请先用 TeamTaskList/TeamTaskGet 查看任务，按角色和优先级选择合适任务，"
+                                "调用 TeamTaskClaim（带上本轮 round_id）成功后再执行。"
+                                "如果认领失败，刷新任务列表，不要执行未认领任务。"
+                                "每次只能持有一个 working 任务；无合适任务则说明原因后待命。"
+                            )
                 pending_prompt = ""
                 if parts:
                     self.store.update_member(
@@ -152,6 +174,9 @@ class TeammateHost:
                         )
                         first_prompt_pending = False
                     self.mailbox.acknowledge(actor, messages)
+                if not shutdown:
+                    for scan in scans:
+                        self.tasks.finish_scan(scan.round_id, actor.actor_id, team_id=actor.team_id)
                 self.store.update_member(
                     actor,
                     launch.agent_id,
