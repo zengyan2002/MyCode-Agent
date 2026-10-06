@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import re
 from collections.abc import Mapping
 from io import StringIO
@@ -75,8 +76,10 @@ _PROVIDER_FIELDS = {
 _STDIO_SERVER_FIELDS = {"type", "command", "args", "env"}
 # HTTP MCP Server 配置允许出现的字段。
 _HTTP_SERVER_FIELDS = {"type", "url", "headers"}
-# 独立子 Agent 配置块只允许调整这四个已批准的运行参数。
+# Agent 配置块包含独立任务运行参数和团队成员空闲回收参数。
 _AGENT_FIELDS = {
+    "team_idle_ttl_seconds",
+    "team_reaper_interval_seconds",
     "auto_background_seconds",
     "agent_tool_timeout_seconds",
     "max_background_tasks",
@@ -828,6 +831,18 @@ def _parse_agent_layer(
         )
 
     parsed: dict[str, float | int | bool] = {}
+    for name in ("team_idle_ttl_seconds", "team_reaper_interval_seconds"):
+        if name in value:
+            seconds = value[name]
+            if (
+                isinstance(seconds, bool)
+                or not isinstance(seconds, (int, float))
+                or not math.isfinite(seconds)
+                or seconds < 0
+                or (name == "team_reaper_interval_seconds" and seconds == 0)
+            ):
+                raise ConfigError(f"配置项 {layer_label}.agents.{name} 必须为有限数，TTL 非负、间隔为正")
+            parsed[name] = float(seconds)
     if "auto_background_seconds" in value:
         seconds = value["auto_background_seconds"]
         if (

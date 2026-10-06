@@ -91,7 +91,7 @@ class TeammateHost:
                 actor,
                 launch.agent_id,
                 lambda member: replace(
-                    member, state=TeammateState.RUNNING, updated_at=_now()
+                    member, state=TeammateState.RUNNING, updated_at=_now(), last_active_at=_now()
                 ),
                 lease_token=launch.lease_token,
             )
@@ -160,7 +160,7 @@ class TeammateHost:
                         actor,
                         launch.agent_id,
                         lambda member: replace(
-                            member, state=TeammateState.RUNNING, updated_at=_now()
+                            member, state=TeammateState.RUNNING, updated_at=_now(), last_active_at=_now()
                         ),
                         lease_token=launch.lease_token,
                     )
@@ -181,7 +181,7 @@ class TeammateHost:
                     actor,
                     launch.agent_id,
                     lambda member: replace(
-                        member, state=TeammateState.IDLE, updated_at=_now()
+                        member, state=TeammateState.IDLE, updated_at=_now(), last_active_at=_now()
                     ),
                     lease_token=launch.lease_token,
                 )

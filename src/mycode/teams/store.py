@@ -186,6 +186,7 @@ def _member_to_json(member: TeammateRecord) -> dict[str, Any]:
         "current_task_id": member.current_task_id,
         "created_at": member.created_at.isoformat(),
         "updated_at": member.updated_at.isoformat(),
+        "last_active_at": (member.last_active_at or member.updated_at).isoformat(),
     }
 
 
@@ -220,6 +221,7 @@ def _member_from_json(raw: dict[str, Any]) -> TeammateRecord:
         current_task_id=raw.get("current_task_id"),
         created_at=datetime.fromisoformat(str(raw["created_at"])),
         updated_at=datetime.fromisoformat(str(raw["updated_at"])),
+        last_active_at=datetime.fromisoformat(str(raw.get("last_active_at", raw["updated_at"]))),
     )
 
 

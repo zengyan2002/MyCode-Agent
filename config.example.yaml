@@ -27,6 +27,9 @@ providers:
 
 # 可选：独立子 Agent 的前后台运行参数。
 agents:
+  # 团队成员空闲 30 分钟后停止 Host，保留会话、Worktree 和分支；0 关闭。
+  team_idle_ttl_seconds: 1800
+  team_reaper_interval_seconds: 60
   # 定义式前台子 Agent 运行到该时间后移交后台；0 表示关闭自动移交。
   auto_background_seconds: 120
   # Agent 工具的外层最终上限。自动移交启用时必须严格大于上面的时间。

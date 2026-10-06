@@ -179,15 +179,19 @@ class AgentSettings:
         enable_verification: 是否把内置 Verification 角色加入可选择目录。
         agent_tool_timeout_seconds: 统一 Agent 工具从开始执行到返回最终文本或
             后台任务 ID 的最长秒数。
+        team_idle_ttl_seconds: 团队成员空闲回收秒数，0 表示关闭。
+        team_reaper_interval_seconds: 团队成员回收检查间隔。
     """
 
     auto_background_seconds: float = 120.0
     max_background_tasks: int = 4
     enable_verification: bool = False
     agent_tool_timeout_seconds: float = 135.0
+    team_idle_ttl_seconds: float = 1800.0
+    team_reaper_interval_seconds: float = 60.0
 
     def __post_init__(self) -> None:
-        """校验四个配置值能直接用于计时器、队列和角色开关。
+        """校验运行开关、计时器和队列参数。
 
         Returns:
             四个字段合法且两个时间字段关系正确时不返回数据。
@@ -203,6 +207,16 @@ class AgentSettings:
             or self.auto_background_seconds < 0
         ):
             raise ValueError("Agent 自动移交秒数必须是非负数")
+        for name in ("team_idle_ttl_seconds", "team_reaper_interval_seconds"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or (name == "team_reaper_interval_seconds" and value == 0)
+            ):
+                raise ValueError(f"{name} 必须是有限数，TTL 非负、检查间隔为正")
         if (
             isinstance(self.max_background_tasks, bool)
             or not isinstance(self.max_background_tasks, int)

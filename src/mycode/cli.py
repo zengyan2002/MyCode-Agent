@@ -696,6 +696,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         session_creator=create_member_session,
         launch_environment={PROFILE_ENV: export_profile(config)},
+        idle_ttl_seconds=config.agents.team_idle_ttl_seconds,
+        reaper_interval_seconds=config.agents.team_reaper_interval_seconds,
     )
 
     async def wake_team_member(

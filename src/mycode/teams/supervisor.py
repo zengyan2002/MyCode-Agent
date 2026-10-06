@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import datetime
@@ -13,6 +14,7 @@ from mycode.models.teams import (
     SpawnTeammateRequest,
     TeamActorContext,
     TeamTaskQuery,
+    TeamTaskStatus,
     TeammateBackend,
     TeammateRecord,
     TeammateState,
@@ -27,6 +29,8 @@ from mycode.teams.backends.base import (
 from mycode.teams.backends.detection import BackendDetector
 from mycode.teams.store import TeamStateStore
 from mycode.teams.tasks import TeamTaskBoard
+from mycode.teams.mailbox import TeamMailbox
+from mycode.teams.locks import ExclusiveFileLock
 from mycode.worktrees.manager import WorktreeManager
 
 
@@ -59,6 +63,8 @@ class TeammateSupervisor:
         adapters: Mapping[TeammateBackend, TeammateBackendAdapter],
         session_creator: MemberSessionCreator,
         launch_environment: Mapping[str, str] | None = None,
+        idle_ttl_seconds: float = 1800.0,
+        reaper_interval_seconds: float = 60.0,
     ) -> None:
         """保存创建和控制成员所需的生产组件。
 
@@ -86,6 +92,108 @@ class TeammateSupervisor:
         self.launch_environment = dict(launch_environment or {})
         self._handles: dict[tuple[str, str], BackendHandle] = {}
         self._assignments = {}
+        self.idle_ttl_seconds = idle_ttl_seconds
+        self.reaper_interval_seconds = reaper_interval_seconds
+        self._control_lock = asyncio.Lock()
+        self._reaper_task: asyncio.Task | None = None
+
+    def start_reaper(self) -> None:
+        """只回收当前 Supervisor 持有的 Host，不根据磁盘 PID 杀进程。"""
+        if self.idle_ttl_seconds > 0 and (self._reaper_task is None or self._reaper_task.done()):
+            self._reaper_task = asyncio.create_task(self._reaper_loop())
+
+    async def close_reaper(self) -> None:
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
+            await asyncio.gather(self._reaper_task, return_exceptions=True)
+            self._reaper_task = None
+
+    async def _reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.reaper_interval_seconds)
+            try:
+                await self.reap_idle()
+            except Exception:
+                logging.getLogger(__name__).exception("团队成员空闲回收失败，将在下轮重试")
+
+    async def _clean_worktree(self, member: TeammateRecord) -> bool:
+        """Git 检查失败、超时或目录不可用时保守跳过。"""
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "git", "status", "--porcelain", "--untracked-files=all",
+                cwd=member.worktree_path, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            async with asyncio.timeout(2.0):
+                output, _ = await process.communicate()
+            return process.returncode == 0 and not output.strip()
+        except (OSError, TimeoutError):
+            return False
+        finally:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+
+    async def reap_idle(self) -> tuple[str, ...]:
+        """先检查 Git，再在任务、邮箱、成员锁内重新确认并撤销旧 Host 租约。"""
+        if self.idle_ttl_seconds <= 0:
+            return ()
+        reaped = []
+        async with self._control_lock:
+            for (team_id, member_id), handle in tuple(self._handles.items()):
+                snapshot = self.store.load_team(team_id)
+                member = next(item for item in snapshot.members if item.agent_id == member_id)
+                if member.backend_ref != handle.reference:
+                    continue
+                if member.state is TeammateState.SUSPENDED and member.lease_token_hash is None:
+                    # 上轮已经撤销租约，但后端停止失败；保留句柄并重试清理。
+                    await self.adapters[member.backend].stop(handle, force=False)
+                    self._handles.pop((team_id, member_id), None)
+                    lead = TeamActorContext(team_id, "lead", "lead", snapshot.team.lead_generation)
+                    self.store.update_member(lead, member_id, lambda latest: replace(
+                        latest, backend_ref=None, owner_pid=None) if
+                        latest.runtime_generation == member.runtime_generation else latest)
+                    continue
+                if member.state is not TeammateState.IDLE:
+                    continue
+                if (_now() - (member.last_active_at or member.updated_at)).total_seconds() < self.idle_ttl_seconds:
+                    continue
+                if member.current_task_id is not None:
+                    continue
+                if not await self._clean_worktree(member):
+                    continue
+                directory = self.store.team_dir(team_id)
+                lead = TeamActorContext(team_id, "lead", "lead", snapshot.team.lead_generation)
+                actor = TeamActorContext(team_id, member_id, "member", member.runtime_generation)
+                # 锁顺序与任务认领一致：tasks -> member；邮箱发送不持有成员锁。
+                with ExclusiveFileLock(directory / "locks" / "tasks.lock", "idle-reaper"):
+                    with ExclusiveFileLock(directory / "locks" / f"mailbox-{member_id}.lock", "idle-reaper"):
+                        current = self.store.load_team(team_id)
+                        if any(t.owner_id == member_id and t.status is TeamTaskStatus.WORKING for t in current.tasks):
+                            continue
+                        if TeamMailbox(self.store).read_unread(actor) or self.tasks.pending_scans(actor):
+                            continue
+                        def suspend(latest):
+                            if (latest.state is not TeammateState.IDLE
+                                    or latest.runtime_generation != member.runtime_generation
+                                    or latest.current_task_id is not None
+                                    or (_now() - (latest.last_active_at or latest.updated_at)).total_seconds() < self.idle_ttl_seconds):
+                                return latest
+                            return replace(latest, state=TeammateState.SUSPENDED,
+                                           runtime_generation=latest.runtime_generation + 1,
+                                           lease_token_hash=None, updated_at=_now())
+                        suspended = self.store.update_member(lead, member_id, suspend)
+                        if suspended.state is not TeammateState.SUSPENDED:
+                            continue
+                # 不删除会话、Worktree、分支，也不释放 Worktree 的保留租约。
+                await self.adapters[member.backend].stop(handle, force=False)
+                self._handles.pop((team_id, member_id), None)
+                self.store.update_member(lead, member_id, lambda latest: replace(
+                    latest, backend_ref=None, owner_pid=None) if
+                    latest.runtime_generation == suspended.runtime_generation else latest)
+                reaped.append(member_id)
+        return tuple(reaped)
 
     async def spawn(
         self,
@@ -106,6 +214,7 @@ class TeammateSupervisor:
                 选定后端失败时不会改用其他后端。
         """
 
+        self.start_reaper()
         team = self.store.require_actor(actor)
         if actor.actor_kind != "lead":
             raise RuntimeError("只有 Lead 能创建团队成员")
@@ -202,14 +311,24 @@ class TeammateSupervisor:
             实际调用后端 wake 时返回 True；成员忙碌或已结束返回 False。
         """
 
-        member = next(
-            item for item in self.store.load_team(team_id).members if item.agent_id == member_id
-        )
-        if member.state not in {TeammateState.IDLE, TeammateState.SUSPENDED}:
-            return False
-        handle = self._handle_for(member)
-        await self.adapters[member.backend].wake(handle)
-        return True
+        async with self._control_lock:
+            snapshot = self.store.load_team(team_id)
+            member = next(item for item in snapshot.members if item.agent_id == member_id)
+            if member.state is TeammateState.SUSPENDED:
+                # 回收与唤醒共用锁，先释放旧句柄，再轮换租约恢复原会话。
+                handle = self._handles.pop((team_id, member_id), None)
+                if handle is not None:
+                    await self.adapters[member.backend].stop(handle, force=False)
+                lead = TeamActorContext(team_id, "lead", "lead", snapshot.team.lead_generation)
+                await self._restart_member(lead, member)
+                return True
+            if member.state is not TeammateState.IDLE:
+                return False
+            lead = TeamActorContext(team_id, "lead", "lead", snapshot.team.lead_generation)
+            self.store.update_member(lead, member_id, lambda current: replace(
+                current, last_active_at=_now(), updated_at=_now()))
+            await self.adapters[member.backend].wake(self._handle_for(member))
+            return True
 
     async def wake_for_claimable_tasks(
         self,
@@ -248,7 +367,9 @@ class TeammateSupervisor:
         member = next(
             item for item in self.store.load_team(actor.team_id).members if item.agent_id == member_id
         )
-        await self.adapters[member.backend].stop(self._handle_for(member), force=force)
+        if member.backend_ref is not None or (actor.team_id, member_id) in self._handles:
+            await self.adapters[member.backend].stop(self._handle_for(member), force=force)
+        self._handles.pop((actor.team_id, member_id), None)
         await self.worktrees.release_team_member_lease(member.worktree_name)
         return self.store.update_member(
             actor,
@@ -269,6 +390,7 @@ class TeammateSupervisor:
             新会话或 Worktree。
         """
 
+        self.start_reaper()
         snapshot = self.store.load_team(team_id)
         lead = TeamActorContext(
             team_id,
@@ -291,6 +413,7 @@ class TeammateSupervisor:
                 except Exception:
                     alive = False
             if alive:
+                self._handles[(team_id, member.agent_id)] = handle
                 reports.append(f"{member.name}: 仍在运行")
                 continue
             try:
@@ -309,6 +432,7 @@ class TeammateSupervisor:
             Host 属于独立进程，不会在主程序退出时停止。
         """
 
+        await self.close_reaper()
         for (team_id, member_id), handle in tuple(self._handles.items()):
             if handle.backend is not TeammateBackend.SUBPROCESS:
                 continue

@@ -207,6 +207,7 @@ class TeammateRecord:
     current_task_id: str | None
     created_at: datetime
     updated_at: datetime
+    last_active_at: datetime | None = None
 
     def __post_init__(self) -> None:
         """校验成员标识、绝对工作目录、generation 和时间字段。
@@ -229,6 +230,8 @@ class TeammateRecord:
             raise ValueError("成员 runtime generation 必须为正数")
         _aware(self.created_at, "created_at")
         _aware(self.updated_at, "updated_at")
+        if self.last_active_at is not None:
+            _aware(self.last_active_at, "last_active_at")
 
 
 @dataclass(frozen=True, slots=True)

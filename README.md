@@ -282,6 +282,20 @@ python -m pytest -q tests/integration/test_docker_command_sandbox.py
 
 创建可领取任务、重新分配任务或解除依赖时，任务板会把认领检查通知与任务一起保存。空闲成员会读取通知；忙碌成员在本轮结束且没有 working 任务后处理通知，完成已有任务后也会再检查待办。新建或恢复成员会检查已有任务。通知不依赖聊天消息或管道唤醒，空闲时只检查本地文件，不反复调用模型。成员按角色选择任务，只有 `TeamTaskClaim` 成功后才能执行；没有合适任务则待命。
 
+## 团队成员空闲回收
+
+Lead 运行期间，Supervisor 默认每 60 秒检查自己持有的成员 Host。成员空闲满
+30 分钟，且没有 working 任务、未读邮箱消息、待处理 ClaimScan 或 Worktree
+未提交改动时，撤销旧租约并停止 Host，状态改为 `suspended`。Git 检查失败或
+超时时跳过回收。回收保留 Session、Worktree、Branch 和 Worktree 保留租约，
+不按磁盘 PID 杀进程。收到新的显式唤醒消息或任务通知后，轮换 generation
+和租约，在原 Worktree 恢复原会话。
+
+可在 `agents` 配置中设置 `team_idle_ttl_seconds`（默认 1800，0 关闭）与
+`team_reaper_interval_seconds`（默认 60，必须大于 0）。旧成员记录缺少
+`last_active_at` 时使用 `updated_at`。此机制针对长期 Team Host；主程序退出
+后的 tmux/iTerm2 Host，以及不属于当前 Supervisor 的进程，不在定时回收范围内。
+
 ## 项目结构
 
 ```text
