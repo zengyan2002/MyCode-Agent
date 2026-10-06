@@ -121,6 +121,19 @@ class TeamService:
             self.store.require_cleanup_actor(actor)
         return self.store.load_team(actor.team_id)
 
+    def list_teams(self, actor: TeamActorContext | None = None) -> tuple[TeamSnapshot, ...]:
+        """让普通主会话或当前有效 Lead 查询本项目的团队，不改变身份。
+
+        actor 来自本地工具上下文；无团队身份的主会话传 None。已有
+        Lead 允许在清理中查询，但成员及旧 Lead 不能调用。
+
+        Returns:
+            按更新时间排序的团队快照；本方法不恢复成员或保存会话绑定。
+        """
+        if actor is not None:
+            self.store.require_cleanup_actor(actor)
+        return self.store.list_teams()
+
     async def spawn_member(
         self,
         actor: TeamActorContext,

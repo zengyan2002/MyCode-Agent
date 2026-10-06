@@ -492,6 +492,19 @@ class TeamStateStore:
         )
         return TeamSnapshot(team, members, tasks, scans, integration)
 
+    def list_teams(self) -> tuple[TeamSnapshot, ...]:
+        """按更新时间列出当前项目索引中的团队，不创建或恢复团队。
+
+        没有索引时返回空元组。索引锁防止读取期间团队被最终删除；成员
+        状态仍是各文件读取时的记录，不表示实际进程存活情况。
+        """
+        if not self._index_path.exists():
+            return ()
+        with ExclusiveFileLock(self._index_lock, "team-list"):
+            index = _read_json(self._index_path, {"teams": {}})
+            snapshots = [self.load_team(team_id) for team_id in sorted(index.get("teams", {}))]
+            return tuple(sorted(snapshots, key=lambda item: item.team.updated_at, reverse=True))
+
     def team_for_lead(self, session_id: str) -> TeamRecord | None:
         """查找当前由一个主会话管理的存续团队。
 

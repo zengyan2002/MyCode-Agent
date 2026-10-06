@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from collections.abc import Mapping
 
 from mycode.models.json_types import JsonValue
-from mycode.models.teams import TeamCreateRequest
+from mycode.models.teams import TeamCreateRequest, TeammateState
 from mycode.models.tools import ToolAccess, ToolDefinition, ToolErrorCode
 from mycode.teams.service import TeamService
+from mycode.teams.store import TeamStoreError
 from mycode.tools.base import ToolContext, ToolOutput
 
 
@@ -158,6 +160,61 @@ class TeamCreateTool:
             return ToolOutput.ok(json.dumps(_snapshot_payload(snapshot), ensure_ascii=False, indent=2))
         except Exception as exc:
             return ToolOutput.fail(ToolErrorCode.INVALID_ARGUMENTS, str(exc))
+
+
+class TeamListTool:
+    """列出当前项目的存续团队，供新主会话确定要接管的团队 ID。
+
+    service 读取启动时绑定的主项目；模型不能传入其他项目路径。
+    """
+
+    def __init__(self, service: TeamService) -> None:
+        self.service = service
+
+    @property
+    def definition(self) -> ToolDefinition:
+        """返回仅接受空参数的只读工具定义，以及发现后接管的使用说明。"""
+        return ToolDefinition(
+            "TeamList",
+            "只读列出当前项目的存续团队及成员记录状态，不探测进程存活。"
+            "新会话接管旧团队前先查询，根据返回的 team_id 调用 TeamTakeover，"
+            "接管仍需用户确认；多个候选无法确定时先询问用户。"
+            "cleaning 或 cleanup_failed 团队不能接管。",
+            {"type": "object", "properties": {}, "additionalProperties": False},
+            ToolAccess.READ,
+        )
+
+    async def execute(self, arguments: Mapping[str, JsonValue], context: ToolContext) -> ToolOutput:
+        """返回团队摘要，不暴露成员会话、邮箱、路径或租约。
+
+        Args:
+            arguments: 注册表已经校验的空对象，没有查询过滤条件。
+            context: 提供当前主 Agent 的本地团队身份。
+
+        Returns:
+            含 teams 数组的 JSON 正文；读取或身份校验失败时返回错误。
+        """
+        del arguments
+        try:
+            snapshots = self.service.list_teams(context.team_actor)
+        except TeamStoreError as exc:
+            return ToolOutput.fail(ToolErrorCode.BLOCKED, str(exc))
+        teams = []
+        for snapshot in snapshots:
+            team = snapshot.team
+            counts = Counter(member.state.value for member in snapshot.members)
+            teams.append({
+                "team_id": team.team_id,
+                "name": team.name,
+                "description": team.description,
+                "lifecycle": team.lifecycle.value,
+                "lead_session_id": team.lead_session_id,
+                "lead_generation": team.lead_generation,
+                "member_count": len(snapshot.members),
+                "member_state_counts": {state.value: counts[state.value] for state in TeammateState},
+                "updated_at": team.updated_at.isoformat(),
+            })
+        return ToolOutput.ok(json.dumps({"teams": teams}, ensure_ascii=False, indent=2))
 
 
 class TeamGetTool:

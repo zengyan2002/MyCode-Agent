@@ -22,17 +22,18 @@ from mycode.tools.interceptors import (
 
 
 TEAM_MANAGEMENT_TOOLS = frozenset(
-    {"TeamCreate", "TeamGet", "TeamDelete", "TeamTakeover", "TeamMemberStop"}
+    {"TeamCreate", "TeamList", "TeamGet", "TeamDelete", "TeamTakeover", "TeamMemberStop"}
 )
 TEAM_TASK_TOOLS = frozenset(
     {"TeamTaskCreate", "TeamTaskList", "TeamTaskGet", "TeamTaskClaim", "TeamTaskUpdate"}
 )
 TEAM_MEMBER_TOOLS = TEAM_TASK_TOOLS | {"SendMessage"}
-ORDINARY_TEAM_TOOLS = frozenset({"TeamCreate", "TeamTakeover"})
+ORDINARY_TEAM_TOOLS = frozenset({"TeamCreate", "TeamList", "TeamTakeover"})
 ACTIVE_LEAD_TOOLS = frozenset(
     {
         "Agent",
         "TeamGet",
+        "TeamList",
         "TeamDelete",
         "TeamMemberStop",
         "TeamTaskCreate",
@@ -176,7 +177,7 @@ class TeamActorInterceptor:
                 ToolErrorCode.BLOCKED, "当前会话不是 Agent Team 的 Lead 或成员"
             )
         try:
-            if name in {"TeamGet", "TeamDelete"}:
+            if name in {"TeamList", "TeamGet", "TeamDelete"}:
                 self.store.require_cleanup_actor(actor)
             else:
                 self.store.require_actor(actor)

@@ -16,6 +16,7 @@ CHILD_DENIED_TOOLS = frozenset(
         "SendMessage",
         "TeamCreate",
         "TeamGet",
+        "TeamList",
         "TeamDelete",
         "TeamTakeover",
         "TeamMemberStop",

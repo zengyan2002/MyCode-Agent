@@ -120,6 +120,7 @@ from mycode.teams.team_tools import (
     TeamCreateTool,
     TeamDeleteTool,
     TeamGetTool,
+    TeamListTool,
     TeamMemberStopTool,
     TeamTakeoverTool,
 )
@@ -774,6 +775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for team_tool in (
         TeamCreateTool(team_service),
         TeamGetTool(team_service),
+        TeamListTool(team_service),
         TeamDeleteTool(team_service),
         TeamTakeoverTool(team_service),
         TeamMemberStopTool(team_service),
