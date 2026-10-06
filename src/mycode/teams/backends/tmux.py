@@ -45,7 +45,7 @@ class TmuxBackend:
         return BackendHandle(self.backend, reference)
 
     async def wake(self, handle: BackendHandle) -> None:
-        """向目标 pane 发送空输入，使其从文件事件等待中醒来。
+        """确认目标 pane 存活；Host 定时读取持久化通知。
 
         Args:
             handle: ``start`` 返回的 pane 或 session 句柄。
@@ -57,9 +57,10 @@ class TmuxBackend:
             RuntimeError: tmux 找不到目标或发送输入失败。
         """
 
-        code, _, stderr = await self._run_plain(["tmux", "send-keys", "-t", handle.reference, "", "Enter"])
-        if code != 0:
-            raise RuntimeError(f"无法唤醒 tmux 成员：{stderr.strip()}")
+        probe = await self.probe(handle)
+        if not probe.alive:
+            raise RuntimeError("成员后端已经退出")
+        # 持久化通知由 Host 定时消费，无须 stdin 按键。
 
     async def stop(self, handle: BackendHandle, *, force: bool) -> None:
         """关闭目标 pane 或 session。

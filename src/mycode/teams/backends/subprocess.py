@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from mycode.models.teams import TeammateBackend
+from mycode.tools.processes import terminate_process_tree
 from mycode.teams.backends.base import BackendHandle, BackendProbe, TeammateLaunch
 
 
@@ -21,7 +22,7 @@ class SubprocessBackend:
 
     backend = TeammateBackend.SUBPROCESS
 
-    def __init__(self, *, stop_timeout: float = 5.0) -> None:
+    def __init__(self, *, stop_timeout: float = 13.0) -> None:
         self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._stop_timeout = stop_timeout
 
@@ -43,27 +44,23 @@ class SubprocessBackend:
         )))
         process = subprocess.Popen(
             self._host_args(launch), cwd=launch.worktree_path, env=environment,
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=(subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if sys.platform == "win32" else 0,
+            start_new_session=sys.platform != "win32",
         )
         reference = f"subprocess-{secrets.token_hex(12)}"
         self._processes[reference] = process
         return BackendHandle(self.backend, reference, process.pid)
 
     async def wake(self, handle: BackendHandle) -> None:
-        """发送换行，通知成员读取持久化邮箱。"""
+        """确认受管成员仍存活；实际唤醒来自持久化邮箱和任务通知。"""
         process = self._processes.get(handle.reference)
         if process is None or process.poll() is not None:
             raise RuntimeError("subprocess 成员已退出或不属于当前 Lead，请恢复成员")
-        assert process.stdin is not None
-        try:
-            process.stdin.write(b"\n")
-            process.stdin.flush()
-        except (OSError, ValueError) as exc:
-            raise RuntimeError("无法唤醒 subprocess 成员：标准输入已关闭") from exc
+        # 消息和认领通知已落盘；Host 定时读取，不再向未消费的 stdin 写入。
 
     async def stop(self, handle: BackendHandle, *, force: bool) -> None:
-        """关闭输入等待退出；超时或强制停止时结束进程并回收句柄。"""
+        """等待 Host 处理停止意图；超时或强制停止时清理受管进程树。"""
         process = self._processes.get(handle.reference)
         if process is None:
             return
@@ -79,7 +76,7 @@ class SubprocessBackend:
                     await asyncio.sleep(0.05)
             if process.poll() is None:
                 try:
-                    process.kill()
+                    await asyncio.to_thread(terminate_process_tree, process)
                 except ProcessLookupError:
                     pass
             await asyncio.to_thread(process.wait)

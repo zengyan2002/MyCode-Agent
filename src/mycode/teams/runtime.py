@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from mycode.agent.conversation import Conversation
 from mycode.agents.catalog import AgentCatalog
-from mycode.agents.runtime import IndependentAgentRuntimeBuilder
+from mycode.agents.runtime import IndependentAgentRuntimeBuilder, AgentRunHandle
 from mycode.constants import DEFAULT_MAX_MODEL_CALLS
 from mycode.context import ArtifactStore, ContextManager
 from mycode.models.agents import (
@@ -56,6 +56,7 @@ class TeamMemberRuntime:
 
     sessions: SessionManager
     execute_turn: TeamTurnExecutor
+    active_run: AgentRunHandle | None = None
 
     async def run(self, prompt: str) -> str:
         """用完整历史执行一轮，并返回成员最后的纯文本答复。
@@ -77,6 +78,11 @@ class TeamMemberRuntime:
         if not result.strip():
             raise RuntimeError("成员本轮没有返回最终文本")
         return result
+
+    def cancel(self) -> None:
+        """让当前模型和工具通过已有取消令牌停止，不提前关闭会话。"""
+        if self.active_run is not None:
+            self.active_run.cancel()
 
     def close(self) -> None:
         """关闭成员会话文件，不删除已经保存的历史。
@@ -382,7 +388,12 @@ class TeamMemberRuntimeFactory:
                 team_actor=actor,
             )
             runner = self.runtime_builder.build(spec, sessions=sessions)
-            result = await runner.start().wait()
+            handle = runner.start()
+            runtime.active_run = handle
+            try:
+                result = await handle.wait()
+            finally:
+                runtime.active_run = None
             if result.status not in {
                 BackgroundTaskStatus.COMPLETED,
                 BackgroundTaskStatus.PARTIAL,
@@ -390,4 +401,5 @@ class TeamMemberRuntimeFactory:
                 raise RuntimeError(result.error or "团队成员运行失败")
             return result.final_text or "团队成员已完成本轮"
 
-        return TeamMemberRuntime(sessions, execute_turn)
+        runtime = TeamMemberRuntime(sessions, execute_turn)
+        return runtime

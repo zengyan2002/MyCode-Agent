@@ -70,6 +70,8 @@ def _snapshot_payload(
                 "worktree": str(item.worktree_path),
                 "branch": item.branch,
                 "current_task_id": item.current_task_id,
+                "last_stop_reason": item.last_stop_reason,
+                "interrupted_at": item.interrupted_at.isoformat() if item.interrupted_at else None,
             }
             for item in snapshot.members
         ],
@@ -157,6 +159,7 @@ class TeamCreateTool:
                     str(arguments["team_name"]), str(arguments.get("description", ""))
                 )
             )
+            await self.service.start_lead_runtime(snapshot.team.team_id)
             return ToolOutput.ok(json.dumps(_snapshot_payload(snapshot), ensure_ascii=False, indent=2))
         except Exception as exc:
             return ToolOutput.fail(ToolErrorCode.INVALID_ARGUMENTS, str(exc))

@@ -187,6 +187,12 @@ def _member_to_json(member: TeammateRecord) -> dict[str, Any]:
         "created_at": member.created_at.isoformat(),
         "updated_at": member.updated_at.isoformat(),
         "last_active_at": (member.last_active_at or member.updated_at).isoformat(),
+        "owner_lead_session_id": member.owner_lead_session_id,
+        "owner_lead_generation": member.owner_lead_generation,
+        "owner_instance_id": member.owner_instance_id,
+        "stop_request_generation": member.stop_request_generation,
+        "last_stop_reason": member.last_stop_reason,
+        "interrupted_at": member.interrupted_at.isoformat() if member.interrupted_at else None,
     }
 
 
@@ -222,6 +228,12 @@ def _member_from_json(raw: dict[str, Any]) -> TeammateRecord:
         created_at=datetime.fromisoformat(str(raw["created_at"])),
         updated_at=datetime.fromisoformat(str(raw["updated_at"])),
         last_active_at=datetime.fromisoformat(str(raw.get("last_active_at", raw["updated_at"]))),
+        owner_lead_session_id=raw.get("owner_lead_session_id"),
+        owner_lead_generation=raw.get("owner_lead_generation"),
+        owner_instance_id=raw.get("owner_instance_id"),
+        stop_request_generation=raw.get("stop_request_generation"),
+        last_stop_reason=raw.get("last_stop_reason"),
+        interrupted_at=datetime.fromisoformat(raw["interrupted_at"]) if raw.get("interrupted_at") else None,
     )
 
 
@@ -504,6 +516,82 @@ class TeamStateStore:
             index = _read_json(self._index_path, {"teams": {}})
             snapshots = [self.load_team(team_id) for team_id in sorted(index.get("teams", {}))]
             return tuple(sorted(snapshots, key=lambda item: item.team.updated_at, reverse=True))
+
+    def read_member(self, team_id: str, member_id: str) -> TeammateRecord:
+        """读取一个成员当前的归属和停止记录，不使用其旧 Actor 授权。"""
+        return _member_from_json(_read_json(self.team_dir(team_id) / "members" / f"{member_id}.json"))
+
+    def read_lead_runtime(self, team_id: str) -> dict[str, Any]:
+        """读取心跳；旧团队没有文件时返回空对象，不创建目录。"""
+        return _read_json(self.team_dir(team_id) / "lead-runtime.json", {})
+
+    def publish_lead_runtime(self, actor: TeamActorContext, payload: dict[str, Any], *, claim: bool = False) -> None:
+        """在索引锁内校验 Lead 代数和运行身份，然后原子保存心跳。"""
+        with ExclusiveFileLock(self._index_lock, "lead-heartbeat"):
+            team = _team_from_json(_read_json(self.team_dir(actor.team_id) / "team.json"))
+            if (actor.actor_kind != "lead" or actor.generation != team.lead_generation
+                    or payload["lead_session_id"] != team.lead_session_id):
+                raise TeamStoreError("Lead 运行身份已失效")
+            current = self.read_lead_runtime(actor.team_id)
+            if not claim and current.get("owner_instance_id") != payload["owner_instance_id"]:
+                raise TeamStoreError("Lead 运行租约已经更换")
+            _atomic_json(self.team_dir(actor.team_id) / "lead-runtime.json", payload)
+
+    def request_member_stop(self, actor: TeamActorContext, member_id: str, generation: int, reason: str) -> None:
+        """当前 Lead 向指定 generation 发布停止意图，清理中也可收尾。"""
+        self.require_cleanup_actor(actor)
+        directory = self.team_dir(actor.team_id)
+        with ExclusiveFileLock(directory / "locks" / f"member-{member_id}.lock", "stop-request"):
+            member = self.read_member(actor.team_id, member_id)
+            if member.runtime_generation == generation:
+                updated = replace(member, stop_request_generation=generation, last_stop_reason=reason)
+                _atomic_json(directory / "members" / f"{member_id}.json", _member_to_json(updated))
+
+    def record_member_stop(self, actor: TeamActorContext, lease_token: str, reason: str) -> bool:
+        """按本次成员租约保存中断及暂停时间，保留任务和代码。
+
+        该内部清理入口允许过期 owner 收尾，但不能更新已更换的成员租约。
+        返回 False 表示新 Host 已接替；调用者必须仅退出自身。
+        """
+        directory = self.team_dir(actor.team_id)
+        with ExclusiveFileLock(directory / "locks" / "tasks.lock", "member-stop"):
+            with ExclusiveFileLock(directory / "locks" / f"member-{actor.actor_id}.lock", "member-stop"):
+                current = self.read_member(actor.team_id, actor.actor_id)
+                if (current.runtime_generation != actor.generation or current.lease_token_hash !=
+                        hashlib.sha256(lease_token.encode()).hexdigest()):
+                    return False
+                raw = _read_json(directory / "tasks.json", {"revision": 0, "tasks": [], "scans": []})
+                changed = False
+                for item in raw.get("tasks", []):
+                    if item.get("owner_id") == actor.actor_id and item.get("status") == "working":
+                        task = task_from_json(item)
+                        if task.attempts:
+                            task = replace(task, attempts=(*task.attempts[:-1], replace(task.attempts[-1], paused_at=_now())),
+                                progress=(task.progress or "") + f"\n成员运行中断：{reason}", updated_at=_now())
+                            item.update(task_to_json(task))
+                            changed = True
+                if changed:
+                    raw["revision"] = int(raw.get("revision", 0)) + 1
+                    _atomic_json(directory / "tasks.json", raw)
+                state = TeammateState.TERMINATED if reason == "explicit_stop" else TeammateState.SUSPENDED
+                updated = replace(current, state=state, lease_token_hash=None, last_stop_reason=reason,
+                    interrupted_at=_now(), updated_at=_now())
+                _atomic_json(directory / "members" / f"{actor.actor_id}.json", _member_to_json(updated))
+                self.append_event(TeamEvent(f"event-{secrets.token_hex(6)}", actor.team_id,
+                    "member_interrupted", actor.actor_id, {"reason": reason, "generation": actor.generation}, _now()))
+                return True
+
+    def require_member_runtime(self, actor: TeamActorContext) -> None:
+        """新工具开始前拒绝已停止、已更换 owner 或撤销租约的成员。"""
+        member = self.read_member(actor.team_id, actor.actor_id)
+        if (member.runtime_generation != actor.generation or member.lease_token_hash is None
+                or member.stop_request_generation == actor.generation):
+            raise TeamStoreError("成员运行租约已停止")
+        owner = self.read_lead_runtime(actor.team_id)
+        team = _team_from_json(_read_json(self.team_dir(actor.team_id) / "team.json"))
+        if (team.lead_generation != member.owner_lead_generation or not member.owner_instance_id or owner.get("owner_instance_id") != member.owner_instance_id
+                or owner.get("released") or owner.get("lead_generation") != member.owner_lead_generation):
+            raise TeamStoreError("成员所属 Lead 运行已失效")
 
     def team_for_lead(self, session_id: str) -> TeamRecord | None:
         """查找当前由一个主会话管理的存续团队。

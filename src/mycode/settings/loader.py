@@ -77,7 +77,9 @@ _STDIO_SERVER_FIELDS = {"type", "command", "args", "env"}
 # HTTP MCP Server 配置允许出现的字段。
 _HTTP_SERVER_FIELDS = {"type", "url", "headers"}
 # Agent 配置块包含独立任务运行参数和团队成员空闲回收参数。
+_WATCHDOG_FIELDS = ('team_heartbeat_interval_seconds', 'team_watchdog_poll_seconds', 'team_lease_timeout_seconds', 'team_watchdog_startup_seconds', 'team_shutdown_grace_seconds')
 _AGENT_FIELDS = {
+    *_WATCHDOG_FIELDS,
     "team_idle_ttl_seconds",
     "team_reaper_interval_seconds",
     "auto_background_seconds",
@@ -831,6 +833,12 @@ def _parse_agent_layer(
         )
 
     parsed: dict[str, float | int | bool] = {}
+    for name in _WATCHDOG_FIELDS:
+        if name in value:
+            seconds = value[name]
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
+                raise ConfigError(f"配置项 {layer_label}.agents.{name} 必须是有限正数")
+            parsed[name] = float(seconds)
     for name in ("team_idle_ttl_seconds", "team_reaper_interval_seconds"):
         if name in value:
             seconds = value[name]

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from mycode.models.teams import TeammateBackend
+from mycode.models.teams import TeammateBackend, TeamWatchdogSettings
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +33,10 @@ class TeammateLaunch:
     lease_token: str
     prompt: str
     environment: Mapping[str, str] = field(default_factory=dict)
+    owner_lead_session_id: str | None = None
+    owner_lead_generation: int | None = None
+    owner_instance_id: str | None = None
+    watchdog: TeamWatchdogSettings = field(default_factory=TeamWatchdogSettings)
 
 
 @dataclass(frozen=True, slots=True)

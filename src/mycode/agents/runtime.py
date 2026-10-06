@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Protocol
 
 from mycode.agent.cancellation import CancellationToken
+from mycode.teams.policy import MemberRuntimeInterceptor
+from mycode.teams.store import TeamStateStore
 from mycode.agent.conversation import Conversation
 from mycode.agent.environment import EnvironmentCollector
 from mycode.agent.instructions import RuntimeInstructionManager
@@ -699,6 +701,7 @@ class IndependentAgentRuntimeBuilder:
             executor,
             interceptors=(
                 PlanOnlyInterceptor(),
+                MemberRuntimeInterceptor(TeamStateStore(self._workspace_root), spec.team_actor),
                 SkillTrustInterceptor(
                     self._registry,
                     skill_approver,

@@ -10,15 +10,22 @@ from mycode.models.teams import (
     TeamActorContext,
     TeamMessageKind,
     TeammateState,
+    TeamTaskStatus,
 )
 from mycode.teams.backends.base import TeammateLaunch, WakeWaiter
 from mycode.teams.mailbox import TeamMailbox
 from mycode.teams.runtime import TeamRuntimeLoader
-from mycode.teams.store import TeamStateStore
+from mycode.teams.store import TeamStateStore, TeamStoreError
 from mycode.teams.tasks import TeamTaskBoard
+from mycode.teams.watchdog import MemberWatchdog
+from mycode.teams.locks import ExclusiveFileLock
 
 
 _MAILBOX_POLL_SECONDS = 0.2
+
+
+class HostShutdownTimeout(RuntimeError):
+    """已记录清理未确认；CLI 必须退出自身，不能无限等待残留协程。"""
 
 
 class TeammateHost:
@@ -51,8 +58,64 @@ class TeammateHost:
         self.mailbox = mailbox
         self.runtime_loader = runtime_loader
         self.tasks = TeamTaskBoard(store)
+        self._runtime = None
+        self._stopping = False
+        self._stop_reason = None
 
-    async def __call__(
+    async def __call__(self, launch: TeammateLaunch, wait_for_wake: WakeWaiter) -> None:
+        """从握手开始监管成员；先取消回合、等待清理，再保存暂停记录。"""
+        lock = ExclusiveFileLock(self.store.team_dir(launch.team_id) / "locks" /
+            f"member-runtime-{launch.agent_id}.lock", launch.agent_id, max_attempts=1)
+        lock.acquire()
+        watchdog = MemberWatchdog(self.store, launch)
+        watch = asyncio.create_task(watchdog.run())
+        async def execute_when_ready():
+            await watchdog.ready.wait()
+            await self._execute(launch, wait_for_wake)
+        execution = asyncio.create_task(execute_when_ready())
+        reason = None
+        cancelled = False
+        actor = TeamActorContext(launch.team_id, launch.agent_id, "member", launch.generation)
+        try:
+            done, _ = await asyncio.wait((watch, execution), return_when=asyncio.FIRST_COMPLETED)
+            if watch in done:
+                try:
+                    reason = watch.result()
+                except Exception:
+                    reason = "watchdog_error"
+            else:
+                await execution
+                reason = self._stop_reason
+                return
+        except asyncio.CancelledError:
+            cancelled = True
+            reason = "member_cancelled"
+        finally:
+            self._stopping = True
+            if self._runtime is not None:
+                self._runtime.cancel()
+            if not execution.done() and (self._runtime is None or self._runtime.active_run is None):
+                execution.cancel()
+            done, _ = await asyncio.wait((execution,), timeout=launch.watchdog.shutdown_grace)
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+            try:
+                if not done:
+                    execution.cancel()
+                    try:
+                        self.store.record_member_stop(actor, launch.lease_token, "cleanup_unconfirmed")
+                    except TeamStoreError as exc:
+                        raise HostShutdownTimeout("成员清理及中断记录保存均未确认") from exc
+                    raise HostShutdownTimeout("成员清理未在宽限期内确认完成")
+                await asyncio.gather(execution, return_exceptions=True)
+                if reason:
+                    self.store.record_member_stop(actor, launch.lease_token, reason)
+            finally:
+                lock.release()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _execute(
         self,
         launch: TeammateLaunch,
         wait_for_wake: WakeWaiter,
@@ -62,7 +125,7 @@ class TeammateHost:
         Args:
             launch: Supervisor 生成的 team/member/generation、租约和工作区。
             wait_for_wake: 在成员空闲时等待一次唤醒的异步函数。
-                独立进程 Host 传入等待标准输入的函数。
+                独立进程 Host 使用可取消的定时等待；实际事件由文件记录提供。
 
         Returns:
             收到 shutdown_request 或 task 被取消后结束，不删除会话和成员。
@@ -87,6 +150,7 @@ class TeammateHost:
                 lease_token=launch.lease_token,
             )
             runtime = await self.runtime_loader(launch.team_id, launch.agent_id)
+            self._runtime = runtime
             self.store.update_member(
                 actor,
                 launch.agent_id,
@@ -102,10 +166,17 @@ class TeammateHost:
                     self.tasks.open_scan(actor.team_id, available, (actor.actor_id,))
             pending_prompt = launch.prompt.strip()
             first_prompt_pending = bool(pending_prompt)
+            snapshot = self.store.load_team(launch.team_id)
+            working = next((t for t in snapshot.tasks if t.owner_id == launch.agent_id
+                and t.status is TeamTaskStatus.WORKING), None)
+            if working is not None:
+                pending_prompt += (f"\n继续本人已持有的 working 任务 {working.task_id}：{working.title}。"
+                    f"已有进度：{working.progress or '无'}。先核对工作区和操作记录，不重复认领或重跑未知写操作。")
             while True:
                 messages = self.mailbox.read_unread(actor)
                 scans = self.tasks.pending_scans(actor)
-                if not pending_prompt and not messages and not scans:
+                if not pending_prompt and not scans and not any(
+                        m.wake or m.kind is TeamMessageKind.SHUTDOWN_REQUEST for m in messages):
                     self.store.update_member(
                         actor,
                         launch.agent_id,
@@ -118,7 +189,7 @@ class TeammateHost:
                         wake_task = asyncio.create_task(wait_for_wake())
                     while True:
                         # 跨进程发送者可能没有后端回调；邮箱中的 wake 消息
-                        # 保留了通知。超时检查不取消已有的标准输入等待。
+                        # 保留了通知。超时检查不取消已有的可取消等待任务。
                         done, _ = await asyncio.wait(
                             (wake_task,), timeout=_MAILBOX_POLL_SECONDS
                         )
@@ -126,11 +197,10 @@ class TeammateHost:
                             completed_wait = wake_task
                             wake_task = None
                             completed_wait.result()
-                            messages = self.mailbox.read_unread(actor)
-                            break
+                            wake_task = asyncio.create_task(wait_for_wake())
                         messages = self.mailbox.read_unread(actor)
                         scans = self.tasks.pending_scans(actor)
-                        if scans or any(message.wake for message in messages):
+                        if scans or any(m.wake or m.kind is TeamMessageKind.SHUTDOWN_REQUEST for m in messages):
                             break
                     scans = self.tasks.pending_scans(actor)
                     if not messages and not scans:
@@ -165,6 +235,8 @@ class TeammateHost:
                         lease_token=launch.lease_token,
                     )
                     await runtime.run("\n\n".join(parts))
+                    if self._stopping:
+                        return
                     if first_prompt_pending:
                         # 只有模型回合成功结束后才清空落盘指令。Host 在此前
                         # 崩溃时，恢复流程仍能重新取得原始任务说明。
@@ -186,10 +258,13 @@ class TeammateHost:
                     lease_token=launch.lease_token,
                 )
                 if shutdown:
+                    self._stop_reason = "explicit_stop"
                     return
         except asyncio.CancelledError:
             raise
         except Exception:
+            if self._stopping:
+                raise
             try:
                 self.store.update_member(
                     actor,

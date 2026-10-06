@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -117,6 +118,25 @@ def _aware(value: datetime, name: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class TeamWatchdogSettings:
+    """冻结一次 Lead 运行使用的心跳、检查和退出期限，单位秒。"""
+    heartbeat_interval: float = 5.0
+    poll_interval: float = 2.0
+    lease_timeout: float = 60.0
+    startup_grace: float = 15.0
+    shutdown_grace: float = 10.0
+
+    def __post_init__(self) -> None:
+        for name in ("heartbeat_interval", "poll_interval", "lease_timeout", "startup_grace", "shutdown_grace"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"看门狗 {name} 必须是有限正数")
+        minimum = self.heartbeat_interval + self.poll_interval
+        if self.lease_timeout <= minimum or self.startup_grace <= minimum:
+            raise ValueError("租约和启动期限必须大于心跳间隔与检查间隔之和")
+
+
+@dataclass(frozen=True, slots=True)
 class TeamRecord:
     """代表一个存续团队的身份、负责人和成员花名册。
 
@@ -208,6 +228,12 @@ class TeammateRecord:
     created_at: datetime
     updated_at: datetime
     last_active_at: datetime | None = None
+    owner_lead_session_id: str | None = None
+    owner_lead_generation: int | None = None
+    owner_instance_id: str | None = None
+    stop_request_generation: int | None = None
+    last_stop_reason: str | None = None
+    interrupted_at: datetime | None = None
 
     def __post_init__(self) -> None:
         """校验成员标识、绝对工作目录、generation 和时间字段。
@@ -232,6 +258,8 @@ class TeammateRecord:
         _aware(self.updated_at, "updated_at")
         if self.last_active_at is not None:
             _aware(self.last_active_at, "last_active_at")
+        if self.interrupted_at is not None:
+            _aware(self.interrupted_at, "interrupted_at")
 
 
 @dataclass(frozen=True, slots=True)

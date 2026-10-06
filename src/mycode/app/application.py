@@ -818,6 +818,12 @@ class ChatApplication:
                         self._ui.next_action()
                     )
         finally:
+            if self._team_service is not None:
+                try:
+                    await self._team_service.release_lead_runtime()
+                except Exception:
+                    self._ui.show_error("Lead 续租释放未确认，成员将按失联期限停止")
+                    exit_code = 1
             if action_task is not None and not action_task.done():
                 action_task.cancel()
                 await asyncio.gather(

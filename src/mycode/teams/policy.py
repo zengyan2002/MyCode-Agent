@@ -186,6 +186,21 @@ class TeamActorInterceptor:
         return InterceptionDecision.allow()
 
 
+class MemberRuntimeInterceptor:
+    """拒绝已失去运行租约的成员开始任何新工具，包括文件和 Shell。"""
+    def __init__(self, store: TeamStateStore, actor: TeamActorContext | None):
+        self.store, self.actor = store, actor
+
+    async def before_tool(self, context: ToolRunContext) -> InterceptionDecision:
+        if self.actor is None or self.actor.actor_kind != "member":
+            return InterceptionDecision.allow()
+        try:
+            self.store.require_member_runtime(self.actor)
+        except TeamStoreError as exc:
+            return InterceptionDecision.deny(ToolErrorCode.BLOCKED, str(exc))
+        return InterceptionDecision.allow()
+
+
 class CoordinatorCommandInterceptor:
     """阻止 Team Lead 用 Shell 绕过 Coordinator 的代码写入限制。
 

@@ -44,7 +44,7 @@ class ITerm2Backend:
         return BackendHandle(self.backend, stdout.strip())
 
     async def wake(self, handle: BackendHandle) -> None:
-        """用 it2 向目标 session 发送空输入触发下一轮事件读取。
+        """确认目标 session 存活；Host 定时读取持久化通知。
 
         Args:
             handle: ``start`` 返回的目标 session 句柄。
@@ -56,9 +56,10 @@ class ITerm2Backend:
             RuntimeError: it2 无法向目标 session 发送输入。
         """
 
-        code, _, stderr = await self._run(["it2", "send-text", "--session", handle.reference, "\n"])
-        if code != 0:
-            raise RuntimeError(f"无法唤醒 iTerm2 成员：{stderr.strip()}")
+        probe = await self.probe(handle)
+        if not probe.alive:
+            raise RuntimeError("成员后端已经退出")
+        # 持久化通知由 Host 定时消费，无须 stdin 按键。
 
     async def stop(self, handle: BackendHandle, *, force: bool) -> None:
         """关闭目标 iTerm2 session。

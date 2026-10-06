@@ -103,6 +103,12 @@ class TeamService:
         )
         return self.store.load_team(team.team_id)
 
+    async def start_lead_runtime(self, team_id: str) -> None:
+        """创建团队后立即取得当前会话的运行权，不等待首个成员任务。"""
+        team = self.store.load_team(team_id).team
+        actor = TeamActorContext(team_id, "lead", "lead", team.lead_generation)
+        await self.supervisor.ensure_owner(actor)
+
     def get(self, actor: TeamActorContext) -> TeamSnapshot:
         """读取当前团队、花名册、任务和合并验证状态。
 
@@ -237,6 +243,7 @@ class TeamService:
             raise RuntimeError(f"无法恢复团队绑定：{warning}")
         binding = metadata.team
         if binding is None:
+            await self.supervisor.release_owners("session_changed")
             self.actor_setter(None)
             return None, ()
         team = self.store.load_team(binding.team_id).team
@@ -248,12 +255,18 @@ class TeamService:
         actor = TeamActorContext(
             team.team_id, "lead", "lead", team.lead_generation
         )
-        self.actor_setter(actor)
         if team.lifecycle is not TeamLifecycle.ACTIVE:
+            self.actor_setter(actor)
             return actor, (
                 f"团队处于 {team.lifecycle.value} 状态，只允许查询或继续 TeamDelete",
             )
-        return actor, await self.supervisor.restore(team.team_id)
+        try:
+            reports = await self.supervisor.restore(team.team_id)
+        except Exception:
+            self.actor_setter(None)
+            raise
+        self.actor_setter(actor)
+        return actor, reports
 
     async def takeover(self, team_id: str) -> TeamActorContext:
         """经终端用户批准后把团队交给当前主会话并递增 generation。
@@ -342,6 +355,7 @@ class TeamService:
                 self.sessions.save_team_binding(None)
                 removed.append(binding_key)
                 self.store.save_cleanup_progress(actor.team_id, tuple(removed))
+            await self.supervisor.release_owners("team_deleted")
             self.store.finish_cleanup(actor.team_id)
             self.actor_setter(None)
             removed.append("team-directory")
@@ -369,11 +383,15 @@ class TeamService:
                 tuple(removed),
             )
 
+    async def release_lead_runtime(self) -> None:
+        """应用开始退出时立即停止续租，不等待记忆等后台资源先关闭。"""
+        await self.supervisor.release_owners("application_shutdown")
+
     async def close_local_hosts(self) -> None:
         """关闭随主程序事件循环运行的成员，不删除团队或成员会话。
 
         Returns:
-            所有 subprocess Host 已暂停后返回。独立终端后端保持运行。
+            所有持有成员后端已停止且 Lead 续租任务已释放后返回。
         """
 
         await self.supervisor.close_local_hosts()

@@ -57,7 +57,7 @@ from mycode.persistence import ProjectInstructionLoader, SessionManager
 from mycode.settings import LocalPermissionStore, load_permission_settings
 from mycode.settings.loader import load_startup_config
 from mycode.models.agents import AgentCatalogSnapshot
-from mycode.models.teams import TeammateBackend
+from mycode.models.teams import TeammateBackend, TeamWatchdogSettings
 from mycode.models.tools import ToolSource
 from mycode.skills.catalog import SkillCatalog
 from mycode.skills.fork import SkillForkRunner
@@ -90,7 +90,7 @@ from mycode.teams.backends.base import TeammateLaunch
 from mycode.teams.backends.iterm2 import ITerm2Backend
 from mycode.teams.backends.tmux import TmuxBackend
 from mycode.teams.backends.subprocess import SubprocessBackend
-from mycode.teams.host import TeammateHost
+from mycode.teams.host import TeammateHost, HostShutdownTimeout
 from mycode.teams.integration import TeamIntegrationService
 from mycode.teams.mailbox import TeamMailbox
 from mycode.teams.message_tool import SendMessageTool
@@ -214,7 +214,6 @@ async def _run_team_host(startup_args: argparse.Namespace) -> int:
         if config.sandbox.backend == "docker":
             command_sandbox = DockerCommandRunner(config.sandbox, workspace_root,
                 config.loaded_config_paths, config.secrets)
-            await command_sandbox.initialize()
     except (ConfigError, DockerError, OSError, ValueError) as exc:
         Console(stderr=True).print(
             f"[错误] {redact_secrets(str(exc))}",
@@ -322,19 +321,25 @@ async def _run_team_host(startup_args: argparse.Namespace) -> int:
             stable_prompt=stable_prompt,
             parent_permissions=permission_controller,
         )
-        host = TeammateHost(team_store, team_mailbox, runtime_factory)
+        async def load_member_runtime(team_id: str, agent_id: str):
+            # Docker 的异步初始化也放在受监管的加载阶段，Lead 失联可取消。
+            if command_sandbox is not None:
+                await command_sandbox.initialize()
+            return await runtime_factory(team_id, agent_id)
+
+        host = TeammateHost(team_store, team_mailbox, load_member_runtime)
 
         async def wait_for_wake() -> None:
-            """阻塞读取窗格标准输入，收到一行后让 Host 检查邮箱。
+            """可取消地等待下一次文件事件检查，不创建标准输入线程。
 
             Returns:
-                tmux 或 iTerm2 adapter 发送换行后返回，不产生数据。
+                检查间隔结束后返回，不读取终端输入。
             """
 
-            line = await asyncio.to_thread(sys.stdin.readline)
-            if line == "":
-                raise RuntimeError("成员 Host 的终端输入已经关闭")
+            await asyncio.sleep(0.2)
 
+        owner_runtime = team_store.read_lead_runtime(team_id)
+        frozen_watchdog = TeamWatchdogSettings(**owner_runtime["settings"])
         launch = TeammateLaunch(
             workspace_root=workspace_root,
             worktree_path=member.worktree_path,
@@ -343,8 +348,16 @@ async def _run_team_host(startup_args: argparse.Namespace) -> int:
             generation=int(generation_text),
             lease_token=lease,
             prompt=team_store.load_runtime_prompt(team_id, agent_id),
+            owner_lead_session_id=member.owner_lead_session_id,
+            owner_lead_generation=member.owner_lead_generation,
+            owner_instance_id=member.owner_instance_id,
+            watchdog=frozen_watchdog,
         )
-        await host(launch, wait_for_wake)
+        try:
+            await host(launch, wait_for_wake)
+        except HostShutdownTimeout:
+            # 看门狗已落盘未确认记录；不能让 asyncio.run 无限等待残留任务。
+            os._exit(1)
         return 0
     except Exception as exc:
         Console(stderr=True).print(
@@ -691,7 +704,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         worktrees=worktree_manager,
         detector=BackendDetector(),
         adapters={
-            TeammateBackend.SUBPROCESS: SubprocessBackend(),
+            TeammateBackend.SUBPROCESS: SubprocessBackend(stop_timeout=
+                config.agents.team_shutdown_grace_seconds + config.agents.team_watchdog_poll_seconds + 1),
             TeammateBackend.TMUX: TmuxBackend(),
             TeammateBackend.ITERM2: ITerm2Backend(),
         },
@@ -699,6 +713,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         launch_environment={PROFILE_ENV: export_profile(config)},
         idle_ttl_seconds=config.agents.team_idle_ttl_seconds,
         reaper_interval_seconds=config.agents.team_reaper_interval_seconds,
+        watchdog_settings=config.agents.team_watchdog,
     )
 
     async def wake_team_member(

@@ -13,6 +13,7 @@ from mycode.constants import (
     DEFAULT_TOOL_BATCH_SPILL_CHARS,
     DEFAULT_TOOL_RESULT_SPILL_CHARS,
 )
+from mycode.models.teams import TeamWatchdogSettings
 from mycode.models.hooks import HookDefinition
 
 
@@ -181,6 +182,11 @@ class AgentSettings:
             后台任务 ID 的最长秒数。
         team_idle_ttl_seconds: 团队成员空闲回收秒数，0 表示关闭。
         team_reaper_interval_seconds: 团队成员回收检查间隔。
+        team_heartbeat_interval_seconds: Lead 独立续租间隔。
+        team_watchdog_poll_seconds: 成员检查租约的间隔。
+        team_lease_timeout_seconds: 有效心跳停止推进后的退出期限。
+        team_watchdog_startup_seconds: 启动时等待心跳推进的期限。
+        team_shutdown_grace_seconds: 成员取消模型和工具后的清理宽限。
     """
 
     auto_background_seconds: float = 120.0
@@ -189,18 +195,32 @@ class AgentSettings:
     agent_tool_timeout_seconds: float = 135.0
     team_idle_ttl_seconds: float = 1800.0
     team_reaper_interval_seconds: float = 60.0
+    team_heartbeat_interval_seconds: float = 5.0
+    team_watchdog_poll_seconds: float = 2.0
+    team_lease_timeout_seconds: float = 60.0
+    team_watchdog_startup_seconds: float = 15.0
+    team_shutdown_grace_seconds: float = 10.0
+
+    @property
+    def team_watchdog(self) -> TeamWatchdogSettings:
+        """返回供 Lead 和成员共同使用的已冻结时间参数。"""
+        return TeamWatchdogSettings(self.team_heartbeat_interval_seconds,
+            self.team_watchdog_poll_seconds, self.team_lease_timeout_seconds,
+            self.team_watchdog_startup_seconds, self.team_shutdown_grace_seconds)
 
     def __post_init__(self) -> None:
         """校验运行开关、计时器和队列参数。
 
         Returns:
-            四个字段合法且两个时间字段关系正确时不返回数据。
+            时间、并发及开关有效，且各期限关系正确时不返回数据。
 
         Raises:
             ValueError: 时间、并发数或开关类型无效，或者 Agent 工具超时
                 没有晚于已经启用的自动移交时间。
         """
 
+        # 复用启动参数的校验，防止 Lead 和成员使用不同的时间规则。
+        self.team_watchdog
         if (
             isinstance(self.auto_background_seconds, bool)
             or not isinstance(self.auto_background_seconds, (int, float))

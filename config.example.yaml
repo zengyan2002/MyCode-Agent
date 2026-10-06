@@ -30,6 +30,13 @@ agents:
   # 团队成员空闲 30 分钟后停止 Host，保留会话、Worktree 和分支；0 关闭。
   team_idle_ttl_seconds: 1800
   team_reaper_interval_seconds: 60
+  # Lead 独立续租，成员自行监管，以下均为秒且必须是有限正数。
+  team_heartbeat_interval_seconds: 5
+  team_watchdog_poll_seconds: 2
+  # 租约期限与启动期限必须大于“心跳间隔 + 检查间隔”。
+  team_lease_timeout_seconds: 60
+  team_watchdog_startup_seconds: 15
+  team_shutdown_grace_seconds: 10
   # 定义式前台子 Agent 运行到该时间后移交后台；0 表示关闭自动移交。
   auto_background_seconds: 120
   # Agent 工具的外层最终上限。自动移交启用时必须严格大于上面的时间。
